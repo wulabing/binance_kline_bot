@@ -1,0 +1,16 @@
+[binance]
+api_key = YOUR_BINANCE_API_KEY
+api_secret = YOUR_BINANCE_API_SECRET
+testnet = false
+
+[telegram]
+bot_token = YOUR_TELEGRAM_BOT_TOKEN
+chat_id = YOUR_TELEGRAM_CHAT_ID
+
+[trading]
+# 默认时间周期 (15m, 1h, 4h)
+default_timeframe = 15m
+
+[database]
+db_path = trading_data.db
+
