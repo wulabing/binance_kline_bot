@@ -58,7 +58,9 @@ class TelegramBot:
                 ENTERING_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.enter_price)]
             },
             fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
-            per_message=True
+            per_message=False,
+            per_chat=True,
+            per_user=True
         )
         self.application.add_handler(add_stop_loss_conv)
         
@@ -69,7 +71,9 @@ class TelegramBot:
                 SELECTING_DELETE_ORDER: [CallbackQueryHandler(self.select_delete_order)]
             },
             fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
-            per_message=True
+            per_message=False,
+            per_chat=True,
+            per_user=True
         )
         self.application.add_handler(delete_stop_loss_conv)
         
@@ -171,9 +175,24 @@ class TelegramBot:
                     f"  方向: {order['side']}\n"
                     f"  类型: {order['type']}\n"
                     f"  价格: {order['price']}\n"
-                    f"  数量: {order['quantity']}\n"
-                    f"  状态: {order['status']}\n\n"
                 )
+                
+                # 添加触发价格（如果有）
+                if order['stop_price'] > 0:
+                    text += f"  触发价格: {order['stop_price']}\n"
+                
+                text += (
+                    f"  数量: {order['quantity']}\n"
+                    f"  状态: {order['status']}\n"
+                )
+                
+                # 添加只减仓标识
+                if order['reduce_only']:
+                    text += "  只减仓: 是\n"
+                else:
+                    text += "  只减仓: 否\n"
+                
+                text += "\n"
             
             await update.message.reply_text(text)
             
@@ -205,8 +224,10 @@ class TelegramBot:
     async def cmd_add_stop_loss(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理 /addstoploss 命令 - 开始添加止损订单流程"""
         try:
+            logger.info(f"用户 {update.message.from_user.id} 执行 /addstoploss 命令")
             # 获取当前持仓
             positions = await self.stop_loss_manager.binance_client.get_positions()
+            logger.info(f"获取到 {len(positions)} 个持仓")
             
             if not positions:
                 await update.message.reply_text("📭 当前没有持仓，无法添加止损订单")
@@ -226,90 +247,140 @@ class TelegramBot:
                 reply_markup=reply_markup
             )
             
+            logger.info(f"已发送持仓选择消息给用户 {update.message.from_user.id}")
             return SELECTING_SYMBOL
             
         except Exception as e:
+            logger.error(f"执行 /addstoploss 命令时出错: {e}", exc_info=True)
             await update.message.reply_text(f"❌ 获取持仓失败: {e}")
             return ConversationHandler.END
 
     async def select_symbol(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """选择交易对"""
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data == "cancel":
-            await query.edit_message_text("❌ 操作已取消")
+        try:
+            query = update.callback_query
+            await query.answer()
+            
+            logger.info(f"用户选择回调: {query.data}")
+            
+            if query.data == "cancel":
+                await query.edit_message_text("❌ 操作已取消")
+                return ConversationHandler.END
+            
+            # 解析选择的交易对和方向
+            parts = query.data.split("_")
+            if len(parts) < 3:
+                logger.error(f"回调数据格式错误: {query.data}")
+                await query.edit_message_text("❌ 数据格式错误，请重新开始")
+                return ConversationHandler.END
+                
+            symbol = parts[1]
+            side = parts[2]
+            logger.info(f"选择交易对: {symbol}, 方向: {side}")
+            
+            # 保存到用户数据
+            user_id = query.from_user.id
+            self.user_data_cache[user_id] = {'symbol': symbol, 'side': side}
+            
+            # 显示时间周期选择
+            keyboard = [
+                [InlineKeyboardButton("15 分钟", callback_data="timeframe_15m")],
+                [InlineKeyboardButton("1 小时", callback_data="timeframe_1h")],
+                [InlineKeyboardButton("4 小时", callback_data="timeframe_4h")],
+                [InlineKeyboardButton("❌ 取消", callback_data="cancel")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"已选择: {symbol} ({side})\n\n请选择 K 线周期：",
+                reply_markup=reply_markup
+            )
+            
+            logger.info(f"已发送时间周期选择消息给用户 {user_id}")
+            return SELECTING_TIMEFRAME
+            
+        except Exception as e:
+            logger.error(f"选择交易对时出错: {e}", exc_info=True)
+            if update.callback_query:
+                await update.callback_query.answer()
+                await update.callback_query.edit_message_text(f"❌ 处理失败: {e}")
             return ConversationHandler.END
-        
-        # 解析选择的交易对和方向
-        parts = query.data.split("_")
-        symbol = parts[1]
-        side = parts[2]
-        
-        # 保存到用户数据
-        user_id = query.from_user.id
-        self.user_data_cache[user_id] = {'symbol': symbol, 'side': side}
-        
-        # 显示时间周期选择
-        keyboard = [
-            [InlineKeyboardButton("15 分钟", callback_data="timeframe_15m")],
-            [InlineKeyboardButton("1 小时", callback_data="timeframe_1h")],
-            [InlineKeyboardButton("4 小时", callback_data="timeframe_4h")],
-            [InlineKeyboardButton("❌ 取消", callback_data="cancel")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            f"已选择: {symbol} ({side})\n\n请选择 K 线周期：",
-            reply_markup=reply_markup
-        )
-        
-        return SELECTING_TIMEFRAME
 
     async def select_timeframe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """选择时间周期"""
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data == "cancel":
-            await query.edit_message_text("❌ 操作已取消")
+        try:
+            query = update.callback_query
+            await query.answer()
+            
+            logger.info(f"用户选择时间周期回调: {query.data}")
+            
+            if query.data == "cancel":
+                await query.edit_message_text("❌ 操作已取消")
+                return ConversationHandler.END
+            
+            # 解析时间周期
+            parts = query.data.split("_")
+            if len(parts) < 2:
+                logger.error(f"时间周期回调数据格式错误: {query.data}")
+                await query.edit_message_text("❌ 数据格式错误，请重新开始")
+                return ConversationHandler.END
+                
+            timeframe = parts[1]
+            
+            # 保存到用户数据
+            user_id = query.from_user.id
+            if user_id not in self.user_data_cache:
+                logger.error(f"用户 {user_id} 的会话数据不存在")
+                await query.edit_message_text("❌ 会话已过期，请重新开始")
+                return ConversationHandler.END
+                
+            self.user_data_cache[user_id]['timeframe'] = timeframe
+            
+            user_data = self.user_data_cache[user_id]
+            
+            await query.edit_message_text(
+                f"已选择:\n"
+                f"  交易对: {user_data['symbol']}\n"
+                f"  方向: {user_data['side']}\n"
+                f"  周期: {timeframe}\n\n"
+                f"请输入止损价格："
+            )
+            
+            logger.info(f"已发送价格输入提示给用户 {user_id}")
+            return ENTERING_PRICE
+            
+        except Exception as e:
+            logger.error(f"选择时间周期时出错: {e}", exc_info=True)
+            if update.callback_query:
+                await update.callback_query.answer()
+                await update.callback_query.edit_message_text(f"❌ 处理失败: {e}")
             return ConversationHandler.END
-        
-        # 解析时间周期
-        timeframe = query.data.split("_")[1]
-        
-        # 保存到用户数据
-        user_id = query.from_user.id
-        self.user_data_cache[user_id]['timeframe'] = timeframe
-        
-        user_data = self.user_data_cache[user_id]
-        
-        await query.edit_message_text(
-            f"已选择:\n"
-            f"  交易对: {user_data['symbol']}\n"
-            f"  方向: {user_data['side']}\n"
-            f"  周期: {timeframe}\n\n"
-            f"请输入止损价格："
-        )
-        
-        return ENTERING_PRICE
 
     async def enter_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """输入止损价格"""
         try:
             user_id = update.message.from_user.id
+            logger.info(f"用户 {user_id} 输入价格: {update.message.text}")
             
             if user_id not in self.user_data_cache:
+                logger.warning(f"用户 {user_id} 的会话数据不存在")
                 await update.message.reply_text("❌ 会话已过期，请重新开始")
                 return ConversationHandler.END
             
             # 解析价格
-            stop_price = float(update.message.text)
+            try:
+                stop_price = float(update.message.text)
+            except ValueError:
+                logger.warning(f"用户 {user_id} 输入的价格格式错误: {update.message.text}")
+                await update.message.reply_text("❌ 价格格式错误，请输入有效数字")
+                return ENTERING_PRICE
             
             user_data = self.user_data_cache[user_id]
             symbol = user_data['symbol']
             side = user_data['side']
             timeframe = user_data['timeframe']
+            
+            logger.info(f"准备创建止损订单: {symbol} {side} @ {stop_price} [{timeframe}]")
             
             # 添加止损订单
             order_id = await self.stop_loss_manager.add_stop_loss_order(
@@ -318,6 +389,8 @@ class TelegramBot:
                 stop_price=stop_price,
                 timeframe=timeframe
             )
+            
+            logger.info(f"止损订单创建成功: ID {order_id}")
             
             await update.message.reply_text(
                 f"✅ 止损订单已创建！\n\n"
@@ -334,10 +407,9 @@ class TelegramBot:
             
             return ConversationHandler.END
             
-        except ValueError:
-            await update.message.reply_text("❌ 价格格式错误，请输入有效数字")
-            return ENTERING_PRICE
         except Exception as e:
+            logger.error(f"创建止损订单时出错: {e}", exc_info=True)
+            user_id = update.message.from_user.id
             await update.message.reply_text(f"❌ 创建止损订单失败: {e}")
             if user_id in self.user_data_cache:
                 del self.user_data_cache[user_id]
@@ -406,7 +478,7 @@ class TelegramBot:
     # ==================== 通知方法 ====================
     
     async def notify_position_update(self, position: Dict):
-        """通知持仓更新"""
+        """通知持仓更新（开仓或持仓变化）"""
         text = (
             f"📊 持仓更新\n\n"
             f"交易对: {position['symbol']}\n"
@@ -414,6 +486,16 @@ class TelegramBot:
             f"数量: {position['position_amt']}\n"
             f"开仓价: {position['entry_price']}\n"
             f"未实现盈亏: {position['unrealized_pnl']:.2f} USDT"
+        )
+        await self.send_message(text)
+
+    async def notify_position_closed(self, data: Dict):
+        """通知平仓"""
+        text = (
+            f"🔒 持仓已平仓\n\n"
+            f"交易对: {data['symbol']}\n"
+            f"方向: {data['previous_side']}\n"
+            f"数量: {data['previous_amount']}"
         )
         await self.send_message(text)
 
@@ -454,10 +536,12 @@ class TelegramBot:
                 f"错误: {data['error']}"
             )
         elif action == 'cleaned':
+            deleted_count = data.get('deleted_count', 0)
             text = (
                 f"🧹 自动清理\n\n"
                 f"交易对: {data['symbol']}\n"
-                f"原因: {data['reason']}"
+                f"原因: {data['reason']}\n"
+                f"已删除止损订单: {deleted_count} 个"
             )
         else:
             text = f"未知操作: {action}"

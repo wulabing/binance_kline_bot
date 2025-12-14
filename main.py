@@ -93,6 +93,7 @@ class TradingBot:
         """设置回调函数"""
         # 币安客户端的回调
         self.binance_client.on_position_update = self.on_position_update
+        self.binance_client.on_position_closed = self.on_position_closed
         self.binance_client.on_order_update = self.on_order_update
         self.binance_client.on_account_update = self.on_account_update
         
@@ -102,9 +103,14 @@ class TradingBot:
         logger.info("回调函数设置完成")
 
     async def on_position_update(self, position):
-        """持仓更新回调"""
+        """持仓更新回调（开仓或持仓变化）"""
         logger.info(f"持仓更新: {position}")
         await self.telegram_bot.notify_position_update(position)
+
+    async def on_position_closed(self, data):
+        """平仓回调"""
+        logger.info(f"持仓已平仓: {data}")
+        await self.telegram_bot.notify_position_closed(data)
 
     async def on_order_update(self, order):
         """订单更新回调"""
@@ -143,6 +149,9 @@ class TradingBot:
             # 启动止损管理器
             await self.stop_loss_manager.start()
             
+            # 初始化持仓缓存（避免首次更新时误判为开仓）
+            await self.initialize_position_cache()
+            
             # 启动币安 WebSocket 用户数据流
             asyncio.create_task(self.binance_client.start_user_data_stream())
             
@@ -166,6 +175,18 @@ class TradingBot:
             raise
         finally:
             await self.stop()
+
+    async def initialize_position_cache(self):
+        """初始化持仓缓存"""
+        try:
+            positions = await self.binance_client.get_positions()
+            for pos in positions:
+                # 根据方向设置正负值
+                position_amt = pos['position_amt'] if pos['side'] == 'LONG' else -pos['position_amt']
+                self.binance_client.position_cache[pos['symbol']] = position_amt
+            logger.info(f"持仓缓存初始化完成，当前持仓数: {len(positions)}")
+        except Exception as e:
+            logger.warning(f"初始化持仓缓存失败: {e}")
 
     async def send_startup_info(self):
         """发送启动信息"""

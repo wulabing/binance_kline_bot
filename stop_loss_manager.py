@@ -39,6 +39,15 @@ class StopLossManager:
         logger.info("启动止损管理器")
         self.running = True
         
+        # 立即初始化持仓缓存（避免监控任务启动时缓存为空）
+        try:
+            positions = await self.binance_client.get_positions()
+            self.current_positions = {pos['symbol']: pos for pos in positions}
+            logger.info(f"止损管理器持仓缓存初始化完成，当前持仓数: {len(positions)}")
+        except Exception as e:
+            logger.warning(f"初始化止损管理器持仓缓存失败: {e}")
+            self.current_positions = {}
+        
         # 启动持仓检查任务
         asyncio.create_task(self._check_positions_loop())
         
@@ -68,18 +77,25 @@ class StopLossManager:
                 # 获取数据库中所有的止损订单
                 all_stop_losses = self.database.get_all_stop_losses()
                 
-                # 检查每个止损订单对应的交易对是否还有持仓
+                # 收集需要清理的交易对（去重，避免同一交易对的多个订单重复处理）
+                symbols_to_clean = set()
                 for order in all_stop_losses:
                     if order.symbol not in self.current_positions:
-                        # 该交易对已无持仓，删除止损订单
-                        self.database.delete_stop_losses_by_symbol(order.symbol)
-                        logger.info(f"清理已平仓交易对 {order.symbol} 的止损订单")
+                        symbols_to_clean.add(order.symbol)
+                
+                # 对每个需要清理的交易对，删除订单并发送通知
+                for symbol in symbols_to_clean:
+                    # 删除该交易对的所有止损订单
+                    deleted_count = self.database.delete_stop_losses_by_symbol(symbol)
+                    if deleted_count > 0:
+                        logger.info(f"清理已平仓交易对 {symbol} 的 {deleted_count} 个止损订单")
                         
                         if self.on_stop_loss_triggered:
                             await self.on_stop_loss_triggered({
                                 'action': 'cleaned',
-                                'symbol': order.symbol,
-                                'reason': '仓位已不存在'
+                                'symbol': symbol,
+                                'reason': '仓位已不存在',
+                                'deleted_count': deleted_count
                             })
                 
             except asyncio.CancelledError:
@@ -274,11 +290,15 @@ class StopLossManager:
     async def add_stop_loss_order(self, symbol: str, side: str, stop_price: float,
                                   timeframe: str, quantity: Optional[float] = None) -> int:
         """添加止损订单"""
+        # 实时获取持仓以确保数据最新
+        positions = await self.binance_client.get_positions()
+        position_dict = {pos['symbol']: pos for pos in positions}
+        
         # 检查持仓是否存在
-        if symbol not in self.current_positions:
+        if symbol not in position_dict:
             raise ValueError(f"交易对 {symbol} 没有持仓")
         
-        position = self.current_positions[symbol]
+        position = position_dict[symbol]
         
         # 验证止损方向
         if position['side'] != side:

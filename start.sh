@@ -45,5 +45,6 @@ echo "启动机器人..."
 echo "按 Ctrl+C 停止"
 echo ""
 
-python3 main.py
+nohup python3 main.py &
+
 

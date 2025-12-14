@@ -36,8 +36,12 @@ class BinanceClient:
         self.session = None
         self.running = False
         
+        # 持仓缓存，用于检测持仓变化（开仓/平仓）
+        self.position_cache = {}  # {symbol: position_amt}
+        
         # 回调函数
         self.on_position_update = None
+        self.on_position_closed = None  # 平仓回调
         self.on_order_update = None
         self.on_account_update = None
 
@@ -132,7 +136,9 @@ class BinanceClient:
                 'price': float(order['price']),
                 'quantity': float(order['origQty']),
                 'status': order['status'],
-                'time': order['time']
+                'time': order['time'],
+                'stop_price': float(order.get('stopPrice', 0)),  # 触发价格
+                'reduce_only': order.get('reduceOnly', False)  # 只减仓模式
             })
         
         return orders
@@ -230,19 +236,48 @@ class BinanceClient:
             # 处理持仓更新
             if 'a' in data and 'P' in data['a']:
                 positions = data['a']['P']
+                
+                # 创建当前持仓快照
+                current_positions = {}
                 for pos in positions:
+                    symbol = pos['s']
                     position_amt = float(pos['pa'])
-                    if position_amt != 0:
-                        position_info = {
-                            'symbol': pos['s'],
-                            'side': 'LONG' if position_amt > 0 else 'SHORT',
-                            'position_amt': abs(position_amt),
-                            'entry_price': float(pos['ep']),
-                            'unrealized_pnl': float(pos['up'])
-                        }
-                        
-                        if self.on_position_update:
-                            await self.on_position_update(position_info)
+                    current_positions[symbol] = position_amt
+                
+                # 检查每个持仓的变化
+                all_symbols = set(self.position_cache.keys()) | set(current_positions.keys())
+                
+                for symbol in all_symbols:
+                    old_amt = self.position_cache.get(symbol, 0.0)
+                    new_amt = current_positions.get(symbol, 0.0)
+                    
+                    # 检测平仓：从非0变为0
+                    if old_amt != 0 and new_amt == 0:
+                        logger.info(f"检测到平仓: {symbol} (从 {old_amt} 变为 0)")
+                        if self.on_position_closed:
+                            await self.on_position_closed({
+                                'symbol': symbol,
+                                'previous_side': 'LONG' if old_amt > 0 else 'SHORT',
+                                'previous_amount': abs(old_amt)
+                            })
+                    
+                    # 检测开仓或持仓变化：从0变为非0，或数量变化
+                    elif new_amt != 0:
+                        # 检查是否是新的持仓或持仓数量有变化
+                        if old_amt == 0 or abs(old_amt) != abs(new_amt):
+                            position_info = {
+                                'symbol': symbol,
+                                'side': 'LONG' if new_amt > 0 else 'SHORT',
+                                'position_amt': abs(new_amt),
+                                'entry_price': float(next((p['ep'] for p in positions if p['s'] == symbol), 0)),
+                                'unrealized_pnl': float(next((p['up'] for p in positions if p['s'] == symbol), 0))
+                            }
+                            
+                            if self.on_position_update:
+                                await self.on_position_update(position_info)
+                
+                # 更新持仓缓存
+                self.position_cache = current_positions.copy()
             
             if self.on_account_update:
                 await self.on_account_update(data)
