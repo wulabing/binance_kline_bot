@@ -2,6 +2,7 @@
 Telegram Bot 模块
 提供用户交互界面，设置和管理止损订单
 """
+import asyncio
 import logging
 from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -40,7 +41,25 @@ class TelegramBot:
 
     async def start(self):
         """启动 Telegram Bot"""
-        self.application = Application.builder().token(self.token).build()
+        # 配置连接参数，增强网络容错性
+        from telegram.ext import Defaults
+        from telegram.request import HTTPXRequest
+        
+        # 创建自定义请求对象，设置更长的超时和重试
+        request = HTTPXRequest(
+            connection_pool_size=8,
+            connect_timeout=30.0,
+            read_timeout=30.0,
+            write_timeout=30.0,
+            pool_timeout=30.0
+        )
+        
+        self.application = (
+            Application.builder()
+            .token(self.token)
+            .request(request)
+            .build()
+        )
         
         # 添加命令处理器
         self.application.add_handler(CommandHandler("start", self.cmd_start))
@@ -95,12 +114,19 @@ class TelegramBot:
             await self.application.shutdown()
         logger.info("Telegram Bot 已停止")
 
-    async def send_message(self, text: str):
-        """发送消息到指定的 chat"""
-        try:
-            await self.application.bot.send_message(chat_id=self.chat_id, text=text)
-        except Exception as e:
-            logger.error(f"发送消息失败: {e}")
+    async def send_message(self, text: str, retry_count: int = 3):
+        """发送消息到指定的 chat，带重试机制"""
+        for attempt in range(retry_count):
+            try:
+                await self.application.bot.send_message(chat_id=self.chat_id, text=text)
+                return  # 发送成功，退出
+            except Exception as e:
+                logger.error(f"发送消息失败 (尝试 {attempt + 1}/{retry_count}): {e}")
+                if attempt < retry_count - 1:
+                    # 等待一段时间后重试（指数退避）
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    logger.error(f"发送消息最终失败，已重试 {retry_count} 次")
 
     # ==================== 命令处理器 ====================
     
@@ -545,6 +571,55 @@ class TelegramBot:
             )
         else:
             text = f"未知操作: {action}"
+        
+        await self.send_message(text)
+
+    async def notify_evaluation(self, data: Dict):
+        """通知K线收盘评估信息"""
+        timeframe = data['timeframe']
+        evaluations = data['evaluations']
+        
+        if not evaluations:
+            return
+        
+        # 按交易对分组评估信息
+        symbol_evaluations = {}
+        for eval_data in evaluations:
+            symbol = eval_data['symbol']
+            if symbol not in symbol_evaluations:
+                symbol_evaluations[symbol] = []
+            symbol_evaluations[symbol].append(eval_data)
+        
+        # 构建消息文本
+        text = f"📊 K线收盘评估 [{timeframe}]\n\n"
+        
+        for symbol, evals in symbol_evaluations.items():
+            text += f"🔸 {symbol}\n"
+            for eval_data in evals:
+                close_price = eval_data['close_price']
+                stop_price = eval_data['stop_price']
+                side = eval_data['side']
+                should_trigger = eval_data['should_trigger']
+                
+                # 计算价格差
+                if side == 'LONG':
+                    price_diff = close_price - stop_price
+                    price_diff_pct = (price_diff / stop_price) * 100 if stop_price > 0 else 0
+                else:  # SHORT
+                    price_diff = stop_price - close_price
+                    price_diff_pct = (price_diff / stop_price) * 100 if stop_price > 0 else 0
+                
+                status_icon = "🔴" if should_trigger else "🟢"
+                status_text = "应执行止损" if should_trigger else "无需止损"
+                
+                text += (
+                    f"  {status_icon} {side} | "
+                    f"收盘价: {close_price:.4f} | "
+                    f"止损价: {stop_price:.4f}\n"
+                    f"     差价: {price_diff:+.4f} ({price_diff_pct:+.2f}%) | "
+                    f"{status_text}\n"
+                )
+            text += "\n"
         
         await self.send_message(text)
 

@@ -76,9 +76,16 @@ class TradingBot:
         self.binance_client = BinanceClient(api_key, api_secret, testnet)
         logger.info(f"币安客户端初始化 (测试网: {testnet})")
         
+        # 读取评估通知配置
+        enable_evaluation_notification = self.config['trading'].getboolean('enable_evaluation_notification', True)
+        
         # 初始化止损管理器
-        self.stop_loss_manager = StopLossManager(self.binance_client, self.database)
-        logger.info("止损管理器初始化")
+        self.stop_loss_manager = StopLossManager(
+            self.binance_client, 
+            self.database,
+            enable_evaluation_notification=enable_evaluation_notification
+        )
+        logger.info(f"止损管理器初始化 (评估通知: {'启用' if enable_evaluation_notification else '禁用'})")
         
         # 初始化 Telegram Bot
         bot_token = self.config['telegram']['bot_token']
@@ -99,6 +106,7 @@ class TradingBot:
         
         # 止损管理器的回调
         self.stop_loss_manager.on_stop_loss_triggered = self.on_stop_loss_triggered
+        self.stop_loss_manager.on_evaluation_notification = self.on_evaluation_notification
         
         logger.info("回调函数设置完成")
 
@@ -125,6 +133,11 @@ class TradingBot:
         """止损触发回调"""
         logger.info(f"止损触发: {data}")
         await self.telegram_bot.notify_stop_loss_triggered(data)
+
+    async def on_evaluation_notification(self, data):
+        """评估信息通知回调"""
+        logger.info(f"K线收盘评估: {data['timeframe']}, {len(data['evaluations'])} 个评估")
+        await self.telegram_bot.notify_evaluation(data)
 
     async def start(self):
         """启动交易机器人"""

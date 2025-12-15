@@ -8,4 +8,7 @@ __pycache__/
 venv/
 .vscode/
 .idea/
+.pid
+nohup.out
+.binance-telegram-venv/
 

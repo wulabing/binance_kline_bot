@@ -15,15 +15,17 @@ logger = logging.getLogger(__name__)
 class StopLossManager:
     """止损管理器"""
     
-    def __init__(self, binance_client: BinanceClient, database: Database):
+    def __init__(self, binance_client: BinanceClient, database: Database, enable_evaluation_notification: bool = True):
         self.binance_client = binance_client
         self.database = database
+        self.enable_evaluation_notification = enable_evaluation_notification
         
         # 存储每个交易对最新的K线收盘时间
         self.last_kline_close_time = {}
         
         # 回调函数
         self.on_stop_loss_triggered = None
+        self.on_evaluation_notification = None
         
         # 监控任务
         self.monitoring_tasks = {}
@@ -33,6 +35,14 @@ class StopLossManager:
         
         # 运行状态
         self.running = False
+        
+        # 用于按周期分组收集评估信息的字典
+        # key: timeframe, value: list of evaluation data
+        self.pending_evaluations = {}
+        
+        # 用于跟踪每个周期是否已经有发送任务在运行
+        # key: timeframe, value: bool
+        self.evaluation_sending_tasks = {}
 
     async def start(self):
         """启动止损管理器"""
@@ -61,6 +71,9 @@ class StopLossManager:
 
     async def _check_positions_loop(self):
         """定期检查持仓，清理已平仓交易对的止损订单"""
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        
         while self.running:
             try:
                 await asyncio.sleep(30)  # 每30秒检查一次
@@ -68,40 +81,54 @@ class StopLossManager:
                 if not self.running:
                     break
                 
-                # 获取当前所有持仓
-                positions = await self.binance_client.get_positions()
-                
-                # 更新持仓缓存
-                self.current_positions = {pos['symbol']: pos for pos in positions}
-                
-                # 获取数据库中所有的止损订单
-                all_stop_losses = self.database.get_all_stop_losses()
-                
-                # 收集需要清理的交易对（去重，避免同一交易对的多个订单重复处理）
-                symbols_to_clean = set()
-                for order in all_stop_losses:
-                    if order.symbol not in self.current_positions:
-                        symbols_to_clean.add(order.symbol)
-                
-                # 对每个需要清理的交易对，删除订单并发送通知
-                for symbol in symbols_to_clean:
-                    # 删除该交易对的所有止损订单
-                    deleted_count = self.database.delete_stop_losses_by_symbol(symbol)
-                    if deleted_count > 0:
-                        logger.info(f"清理已平仓交易对 {symbol} 的 {deleted_count} 个止损订单")
-                        
-                        if self.on_stop_loss_triggered:
-                            await self.on_stop_loss_triggered({
-                                'action': 'cleaned',
-                                'symbol': symbol,
-                                'reason': '仓位已不存在',
-                                'deleted_count': deleted_count
-                            })
+                try:
+                    # 获取当前所有持仓
+                    positions = await self.binance_client.get_positions()
+                    
+                    # 重置错误计数
+                    consecutive_errors = 0
+                    
+                    # 更新持仓缓存
+                    self.current_positions = {pos['symbol']: pos for pos in positions}
+                    
+                    # 获取数据库中所有的止损订单
+                    all_stop_losses = self.database.get_all_stop_losses()
+                    
+                    # 收集需要清理的交易对（去重，避免同一交易对的多个订单重复处理）
+                    symbols_to_clean = set()
+                    for order in all_stop_losses:
+                        if order.symbol not in self.current_positions:
+                            symbols_to_clean.add(order.symbol)
+                    
+                    # 对每个需要清理的交易对，删除订单并发送通知
+                    for symbol in symbols_to_clean:
+                        # 删除该交易对的所有止损订单
+                        deleted_count = self.database.delete_stop_losses_by_symbol(symbol)
+                        if deleted_count > 0:
+                            logger.info(f"清理已平仓交易对 {symbol} 的 {deleted_count} 个止损订单")
+                            
+                            if self.on_stop_loss_triggered:
+                                await self.on_stop_loss_triggered({
+                                    'action': 'cleaned',
+                                    'symbol': symbol,
+                                    'reason': '仓位已不存在',
+                                    'deleted_count': deleted_count
+                                })
+                                
+                except Exception as e:
+                    consecutive_errors += 1
+                    logger.error(f"检查持仓时出错 ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                    
+                    # 如果连续错误次数过多，等待更长时间
+                    if consecutive_errors >= max_consecutive_errors:
+                        logger.warning(f"持仓检查连续失败 {consecutive_errors} 次，等待60秒后继续...")
+                        await asyncio.sleep(60)
+                        consecutive_errors = 0
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"检查持仓时出错: {e}")
+                logger.error(f"持仓检查循环异常: {e}")
 
     async def _monitor_stop_losses(self):
         """监控所有止损订单"""
@@ -143,6 +170,9 @@ class StopLossManager:
         # 转换时间周期为秒数
         interval_seconds = self._timeframe_to_seconds(timeframe)
         
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        
         while self.running:
             try:
                 # 获取该交易对和时间周期的所有止损订单
@@ -159,40 +189,75 @@ class StopLossManager:
                     logger.info(f"停止监控 {symbol} [{timeframe}]，无持仓")
                     break
                 
-                # 获取最新的K线数据
-                klines = await self.binance_client.get_kline_data(symbol, timeframe, limit=1)
-                
-                if not klines:
-                    await asyncio.sleep(5)
-                    continue
-                
-                latest_kline = klines[0]
-                close_time = latest_kline['close_time']
-                current_time = int(datetime.now().timestamp() * 1000)
-                
-                # 检查K线是否已经收盘
-                if current_time >= close_time:
-                    # K线已收盘，使用收盘价
-                    price = latest_kline['close']
+                try:
+                    # 获取最近2根K线：最新的一根可能还在进行中，第二根是已收盘的
+                    # 我们应该评估已经完全收盘的K线，而不是正在进行中的K线
+                    klines = await self.binance_client.get_kline_data(symbol, timeframe, limit=2)
                     
-                    # 检查是否是新的K线（避免重复触发）
-                    last_close = self.last_kline_close_time.get(f"{symbol}_{timeframe}", 0)
-                    if close_time > last_close:
-                        self.last_kline_close_time[f"{symbol}_{timeframe}"] = close_time
+                    # 重置错误计数
+                    consecutive_errors = 0
+                    
+                    if not klines:
+                        await asyncio.sleep(5)
+                        continue
+                    
+                    current_time = int(datetime.now().timestamp() * 1000)
+                    last_processed_close = self.last_kline_close_time.get(f"{symbol}_{timeframe}", 0)
+                    
+                    # 找出最近一根已经收盘且未处理过的K线
+                    kline_to_check = None
+                    
+                    for kline in klines:
+                        kline_close_time = kline['close_time']
+                        
+                        # 检查这根K线是否：1) 已收盘  2) 未处理过
+                        if current_time >= kline_close_time and kline_close_time > last_processed_close:
+                            kline_to_check = kline
+                            logger.info(
+                                f"{symbol} [{timeframe}] 找到待评估的已收盘K线: "
+                                f"开盘时间={datetime.fromtimestamp(kline['open_time']/1000).strftime('%H:%M:%S')}, "
+                                f"收盘时间={datetime.fromtimestamp(kline_close_time/1000).strftime('%H:%M:%S')}, "
+                                f"收盘价={kline['close']}"
+                            )
+                            break  # 只处理最近的一根
+                    
+                    # 处理找到的已收盘K线
+                    if kline_to_check:
+                        price = kline_to_check['close']
+                        check_close_time = kline_to_check['close_time']
+                        
+                        # 更新最后处理的收盘时间（避免重复处理）
+                        self.last_kline_close_time[f"{symbol}_{timeframe}"] = check_close_time
+                        
+                        # 收集评估信息（如果启用）
+                        if self.enable_evaluation_notification:
+                            await self._collect_evaluation(symbol, timeframe, price, orders)
                         
                         # 检查每个止损订单
                         for order in orders:
                             await self._check_stop_loss_trigger(order, price)
-                
-                # 等待一段时间再检查
-                await asyncio.sleep(min(10, interval_seconds // 6))
+                    
+                    # 等待一段时间再检查
+                    await asyncio.sleep(min(10, interval_seconds // 6))
+                    
+                except Exception as e:
+                    consecutive_errors += 1
+                    logger.error(f"监控 {symbol} [{timeframe}] 时出错 ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                    
+                    # 如果连续错误次数过多，等待更长时间
+                    if consecutive_errors >= max_consecutive_errors:
+                        logger.warning(f"{symbol} [{timeframe}] 监控连续失败 {consecutive_errors} 次，等待30秒后继续...")
+                        await asyncio.sleep(30)
+                        consecutive_errors = 0
+                    else:
+                        await asyncio.sleep(5)
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 if not self.running:
                     break
-                logger.error(f"监控 {symbol} [{timeframe}] 时出错: {e}")
+                logger.error(f"监控 {symbol} [{timeframe}] 循环异常: {e}")
                 await asyncio.sleep(5)
 
     async def _check_stop_loss_trigger(self, order: StopLossOrder, current_price: float):
@@ -230,19 +295,24 @@ class StopLossManager:
             # 确定平仓方向（多头平仓=卖出，空头平仓=买入）
             side = 'SELL' if order.side == 'LONG' else 'BUY'
             
+            # 确定持仓方向参数（用于双向持仓模式）
+            position_side = order.side  # LONG 或 SHORT
+            
             # 确定平仓数量
             quantity = order.quantity if order.quantity else position['position_amt']
             
             logger.info(
                 f"执行止损: {order.symbol} {side} {quantity} "
-                f"(触发价: {trigger_price}, 止损价: {order.stop_price})"
+                f"(持仓方向: {position_side}, 触发价: {trigger_price}, 止损价: {order.stop_price})"
             )
             
-            # 下市价单
+            # 下市价单，指定持仓方向和只减仓模式
             result = await self.binance_client.place_market_order(
                 symbol=order.symbol,
                 side=side,
-                quantity=quantity
+                quantity=quantity,
+                position_side=position_side,  # 指定持仓方向
+                reduce_only=True  # 只减仓模式，确保是平仓订单
             )
             
             logger.info(f"止损订单已执行: {result}")
@@ -286,6 +356,86 @@ class StopLossManager:
             '1d': 86400
         }
         return mapping.get(timeframe, 900)
+
+    async def _collect_evaluation(self, symbol: str, timeframe: str, close_price: float, orders: List[StopLossOrder]):
+        """收集评估信息"""
+        try:
+            # 获取持仓信息
+            position = self.current_positions.get(symbol)
+            if not position:
+                return
+            
+            # 为每个订单评估是否应该执行止损
+            evaluations = []
+            for order in orders:
+                should_trigger = False
+                
+                # 判断是否应该触发止损
+                if order.side == 'LONG':
+                    # 多头止损：当前价格 <= 止损价格
+                    should_trigger = close_price <= order.stop_price
+                else:  # SHORT
+                    # 空头止损：当前价格 >= 止损价格
+                    should_trigger = close_price >= order.stop_price
+                
+                evaluations.append({
+                    'symbol': symbol,
+                    'side': order.side,
+                    'close_price': close_price,
+                    'stop_price': order.stop_price,
+                    'should_trigger': should_trigger,
+                    'order_id': order.id
+                })
+            
+            # 按周期分组存储评估信息
+            if timeframe not in self.pending_evaluations:
+                self.pending_evaluations[timeframe] = []
+            
+            # 添加评估信息
+            self.pending_evaluations[timeframe].extend(evaluations)
+            logger.info(f"收集到 {symbol} [{timeframe}] 的评估信息，当前待发送数量: {len(self.pending_evaluations[timeframe])}")
+            
+            # 触发发送评估信息（延迟一段时间，以便收集同一周期的多个币种）
+            # 如果该周期还没有发送任务在运行，则创建新任务
+            if timeframe not in self.evaluation_sending_tasks or not self.evaluation_sending_tasks[timeframe]:
+                self.evaluation_sending_tasks[timeframe] = True
+                logger.info(f"启动 {timeframe} 周期的评估信息发送任务")
+                asyncio.create_task(self._send_evaluation_after_delay(timeframe))
+            else:
+                logger.info(f"{timeframe} 周期的评估信息发送任务已在运行中，等待合并发送")
+            
+        except Exception as e:
+            logger.error(f"收集评估信息时出错: {e}")
+    
+    async def _send_evaluation_after_delay(self, timeframe: str):
+        """延迟发送评估信息，以便收集同一周期的多个币种"""
+        try:
+            # 等待8秒，让同一周期的所有币种都有机会收集评估信息
+            # 增加延迟以避免整点时多个币种评估信息丢失
+            await asyncio.sleep(8)
+            
+            # 检查是否还有待发送的评估信息
+            if timeframe not in self.pending_evaluations or not self.pending_evaluations[timeframe]:
+                self.evaluation_sending_tasks[timeframe] = False
+                return
+            
+            # 获取该周期的所有评估信息（先复制再清空，避免竞争条件）
+            evaluations = self.pending_evaluations[timeframe].copy()
+            # 清空待发送列表
+            self.pending_evaluations[timeframe] = []
+            
+            # 发送评估信息
+            if self.on_evaluation_notification and evaluations:
+                logger.info(f"发送 {timeframe} 周期的评估信息，包含 {len(evaluations)} 条评估")
+                await self.on_evaluation_notification({
+                    'timeframe': timeframe,
+                    'evaluations': evaluations
+                })
+        except Exception as e:
+            logger.error(f"发送评估信息时出错: {e}")
+        finally:
+            # 重置发送任务标志
+            self.evaluation_sending_tasks[timeframe] = False
 
     async def add_stop_loss_order(self, symbol: str, side: str, stop_price: float,
                                   timeframe: str, quantity: Optional[float] = None) -> int:
