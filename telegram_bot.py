@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 
 # 会话状态
 (SELECTING_SYMBOL, SELECTING_TIMEFRAME, ENTERING_PRICE, 
- SELECTING_DELETE_ORDER) = range(4)
+ SELECTING_DELETE_ORDER, SELECTING_UPDATE_ORDER, SELECTING_UPDATE_FIELD,
+ UPDATING_PRICE, UPDATING_TIMEFRAME) = range(8)
 
 
 class TelegramBot:
@@ -96,6 +97,22 @@ class TelegramBot:
         )
         self.application.add_handler(delete_stop_loss_conv)
         
+        # 更新止损订单会话处理器
+        update_stop_loss_conv = ConversationHandler(
+            entry_points=[CommandHandler("updatestoploss", self.cmd_update_stop_loss)],
+            states={
+                SELECTING_UPDATE_ORDER: [CallbackQueryHandler(self.select_update_order)],
+                SELECTING_UPDATE_FIELD: [CallbackQueryHandler(self.select_update_field)],
+                UPDATING_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.update_price)],
+                UPDATING_TIMEFRAME: [CallbackQueryHandler(self.update_timeframe)]
+            },
+            fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
+            per_message=False,
+            per_chat=True,
+            per_user=True
+        )
+        self.application.add_handler(update_stop_loss_conv)
+        
         # 回调查询处理器
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
         
@@ -149,6 +166,7 @@ class TelegramBot:
             "/orders - 查看币安委托订单\n"
             "/stoplosses - 查看所有止损订单\n"
             "/addstoploss - 添加止损订单\n"
+            "/updatestoploss - 更新止损价格\n"
             "/deletestoploss - 删除止损订单\n"
             "/cancel - 取消当前操作\n\n"
             "⚠️ 注意：\n"
@@ -487,6 +505,291 @@ class TelegramBot:
         
         return ConversationHandler.END
 
+    async def cmd_update_stop_loss(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /updatestoploss 命令 - 更新止损价格"""
+        stop_losses = self.database.get_all_stop_losses()
+        
+        if not stop_losses:
+            await update.message.reply_text("📭 当前没有止损订单")
+            return ConversationHandler.END
+        
+        # 创建按钮
+        keyboard = []
+        for order in stop_losses:
+            button_text = f"ID:{order.id} {order.symbol} {order.side} @ {order.stop_price} [{order.timeframe}]"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"update_{order.id}")])
+        
+        keyboard.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "请选择要更新的止损订单：",
+            reply_markup=reply_markup
+        )
+        
+        return SELECTING_UPDATE_ORDER
+
+    async def select_update_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """选择要更新的订单"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "cancel":
+            await query.edit_message_text("❌ 操作已取消")
+            return ConversationHandler.END
+        
+        # 解析订单ID
+        order_id = int(query.data.split("_")[1])
+        
+        # 获取订单信息
+        order = self.database.get_stop_loss_by_id(order_id)
+        
+        if not order:
+            await query.edit_message_text("❌ 订单不存在")
+            return ConversationHandler.END
+        
+        # 保存到用户数据
+        user_id = query.from_user.id
+        self.user_data_cache[user_id] = {'order_id': order_id, 'order': order}
+        
+        # 显示修改选项
+        keyboard = [
+            [InlineKeyboardButton("💰 只修改价格", callback_data="field_price")],
+            [InlineKeyboardButton("⏰ 只修改周期", callback_data="field_timeframe")],
+            [InlineKeyboardButton("💰⏰ 修改价格和周期", callback_data="field_both")],
+            [InlineKeyboardButton("❌ 取消", callback_data="cancel")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"当前止损订单信息：\n\n"
+            f"交易对: {order.symbol}\n"
+            f"方向: {order.side}\n"
+            f"当前止损价: {order.stop_price}\n"
+            f"当前周期: {order.timeframe}\n\n"
+            f"请选择要修改的内容：",
+            reply_markup=reply_markup
+        )
+        
+        return SELECTING_UPDATE_FIELD
+
+    async def select_update_field(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """选择要修改的字段"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "cancel":
+            await query.edit_message_text("❌ 操作已取消")
+            user_id = query.from_user.id
+            if user_id in self.user_data_cache:
+                del self.user_data_cache[user_id]
+            return ConversationHandler.END
+        
+        user_id = query.from_user.id
+        if user_id not in self.user_data_cache:
+            await query.edit_message_text("❌ 会话已过期，请重新开始")
+            return ConversationHandler.END
+        
+        field = query.data.split("_")[1]
+        self.user_data_cache[user_id]['update_field'] = field
+        order = self.user_data_cache[user_id]['order']
+        
+        if field == "price":
+            # 只修改价格
+            await query.edit_message_text(
+                f"当前止损价: {order.stop_price}\n\n"
+                f"请输入新的止损价格："
+            )
+            return UPDATING_PRICE
+            
+        elif field == "timeframe":
+            # 只修改周期
+            keyboard = [
+                [InlineKeyboardButton("15 分钟", callback_data="newtf_15m")],
+                [InlineKeyboardButton("1 小时", callback_data="newtf_1h")],
+                [InlineKeyboardButton("4 小时", callback_data="newtf_4h")],
+                [InlineKeyboardButton("❌ 取消", callback_data="cancel")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"当前周期: {order.timeframe}\n\n"
+                f"请选择新的 K 线周期：",
+                reply_markup=reply_markup
+            )
+            return UPDATING_TIMEFRAME
+            
+        elif field == "both":
+            # 修改价格和周期，先选周期
+            self.user_data_cache[user_id]['update_both'] = True
+            
+            keyboard = [
+                [InlineKeyboardButton("15 分钟", callback_data="newtf_15m")],
+                [InlineKeyboardButton("1 小时", callback_data="newtf_1h")],
+                [InlineKeyboardButton("4 小时", callback_data="newtf_4h")],
+                [InlineKeyboardButton("❌ 取消", callback_data="cancel")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"当前周期: {order.timeframe}\n\n"
+                f"请选择新的 K 线周期：",
+                reply_markup=reply_markup
+            )
+            return UPDATING_TIMEFRAME
+
+    async def update_timeframe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """更新周期"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "cancel":
+            await query.edit_message_text("❌ 操作已取消")
+            user_id = query.from_user.id
+            if user_id in self.user_data_cache:
+                del self.user_data_cache[user_id]
+            return ConversationHandler.END
+        
+        user_id = query.from_user.id
+        if user_id not in self.user_data_cache:
+            await query.edit_message_text("❌ 会话已过期，请重新开始")
+            return ConversationHandler.END
+        
+        # 解析新周期
+        new_timeframe = query.data.split("_")[1]
+        
+        user_data = self.user_data_cache[user_id]
+        order_id = user_data['order_id']
+        order = user_data['order']
+        update_both = user_data.get('update_both', False)
+        
+        if update_both:
+            # 需要继续输入价格
+            self.user_data_cache[user_id]['new_timeframe'] = new_timeframe
+            
+            await query.edit_message_text(
+                f"已选择新周期: {new_timeframe}\n"
+                f"当前止损价: {order.stop_price}\n\n"
+                f"请输入新的止损价格："
+            )
+            return UPDATING_PRICE
+        else:
+            # 只修改周期，直接更新
+            try:
+                success = self.database.update_stop_loss(order_id, timeframe=new_timeframe)
+                
+                if success:
+                    logger.info(f"止损订单周期更新成功: ID {order_id}, {order.timeframe} -> {new_timeframe}")
+                    
+                    await query.edit_message_text(
+                        f"✅ 止损周期已更新！\n\n"
+                        f"订单ID: {order_id}\n"
+                        f"交易对: {order.symbol}\n"
+                        f"方向: {order.side}\n"
+                        f"止损价: {order.stop_price}\n"
+                        f"原周期: {order.timeframe}\n"
+                        f"新周期: {new_timeframe}\n\n"
+                        f"⚠️ 系统会自动停止旧周期的监控任务，并在5秒内启动新周期的监控。"
+                    )
+                else:
+                    await query.edit_message_text(f"❌ 更新失败，订单 {order_id} 可能已不存在")
+                
+                # 清理缓存
+                del self.user_data_cache[user_id]
+                
+                return ConversationHandler.END
+                
+            except Exception as e:
+                logger.error(f"更新止损周期时出错: {e}", exc_info=True)
+                await query.edit_message_text(f"❌ 更新止损周期失败: {e}")
+                if user_id in self.user_data_cache:
+                    del self.user_data_cache[user_id]
+                return ConversationHandler.END
+
+    async def update_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """更新止损价格"""
+        try:
+            user_id = update.message.from_user.id
+            logger.info(f"用户 {user_id} 输入新价格: {update.message.text}")
+            
+            if user_id not in self.user_data_cache:
+                logger.warning(f"用户 {user_id} 的会话数据不存在")
+                await update.message.reply_text("❌ 会话已过期，请重新开始")
+                return ConversationHandler.END
+            
+            # 解析新价格
+            try:
+                new_stop_price = float(update.message.text)
+            except ValueError:
+                logger.warning(f"用户 {user_id} 输入的价格格式错误: {update.message.text}")
+                await update.message.reply_text("❌ 价格格式错误，请输入有效数字")
+                return UPDATING_PRICE
+            
+            user_data = self.user_data_cache[user_id]
+            order_id = user_data['order_id']
+            order = user_data['order']
+            new_timeframe = user_data.get('new_timeframe')
+            update_both = user_data.get('update_both', False)
+            
+            # 根据是否同时更新周期来更新
+            if update_both and new_timeframe:
+                # 同时更新价格和周期
+                logger.info(f"准备更新止损订单 {order_id}: 价格 {order.stop_price} -> {new_stop_price}, 周期 {order.timeframe} -> {new_timeframe}")
+                
+                success = self.database.update_stop_loss(
+                    order_id, 
+                    stop_price=new_stop_price,
+                    timeframe=new_timeframe
+                )
+                
+                if success:
+                    logger.info(f"止损订单更新成功: ID {order_id}")
+                    
+                    await update.message.reply_text(
+                        f"✅ 止损订单已更新！\n\n"
+                        f"订单ID: {order_id}\n"
+                        f"交易对: {order.symbol}\n"
+                        f"方向: {order.side}\n"
+                        f"原止损价: {order.stop_price} → 新止损价: {new_stop_price}\n"
+                        f"原周期: {order.timeframe} → 新周期: {new_timeframe}\n\n"
+                        f"⚠️ 系统会自动停止旧周期的监控任务，并在5秒内启动新周期的监控。"
+                    )
+                else:
+                    await update.message.reply_text(f"❌ 更新失败，订单 {order_id} 可能已不存在")
+            else:
+                # 只更新价格
+                logger.info(f"准备更新止损订单 {order_id}: {order.stop_price} -> {new_stop_price}")
+                
+                success = self.database.update_stop_loss(order_id, stop_price=new_stop_price)
+                
+                if success:
+                    logger.info(f"止损订单价格更新成功: ID {order_id}")
+                    
+                    await update.message.reply_text(
+                        f"✅ 止损价格已更新！\n\n"
+                        f"订单ID: {order_id}\n"
+                        f"交易对: {order.symbol}\n"
+                        f"方向: {order.side}\n"
+                        f"原止损价: {order.stop_price}\n"
+                        f"新止损价: {new_stop_price}\n"
+                        f"周期: {order.timeframe}"
+                    )
+                else:
+                    await update.message.reply_text(f"❌ 更新失败，订单 {order_id} 可能已不存在")
+            
+            # 清理缓存
+            del self.user_data_cache[user_id]
+            
+            return ConversationHandler.END
+            
+        except Exception as e:
+            logger.error(f"更新止损价格时出错: {e}", exc_info=True)
+            user_id = update.message.from_user.id
+            await update.message.reply_text(f"❌ 更新止损价格失败: {e}")
+            if user_id in self.user_data_cache:
+                del self.user_data_cache[user_id]
+            return ConversationHandler.END
+
     async def cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理 /cancel 命令 - 取消当前操作"""
         user_id = update.message.from_user.id
@@ -527,6 +830,16 @@ class TelegramBot:
 
     async def notify_order_update(self, order: Dict):
         """通知订单更新"""
+        # 过滤订单状态，只通知重要的状态变化
+        # 跳过：NEW（新订单）和 PARTIALLY_FILLED（部分成交）
+        # 通知：FILLED（完全成交）、CANCELED（取消）、EXPIRED（过期）、REJECTED（拒绝）
+        status = order['status']
+        
+        if status in ['NEW', 'PARTIALLY_FILLED']:
+            # 不发送通知，避免太多噪音
+            logger.debug(f"跳过订单状态通知: {order['symbol']} {status}")
+            return
+        
         text = (
             f"📋 订单更新\n\n"
             f"交易对: {order['symbol']}\n"
@@ -535,7 +848,8 @@ class TelegramBot:
             f"类型: {order['type']}\n"
             f"状态: {order['status']}\n"
             f"价格: {order['price']}\n"
-            f"数量: {order['quantity']}"
+            f"数量: {order['quantity']}\n"
+            f"已成交: {order.get('executed_qty', 0)}"
         )
         await self.send_message(text)
 

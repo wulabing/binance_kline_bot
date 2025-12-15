@@ -306,13 +306,12 @@ class StopLossManager:
                 f"(持仓方向: {position_side}, 触发价: {trigger_price}, 止损价: {order.stop_price})"
             )
             
-            # 下市价单，指定持仓方向和只减仓模式
+            # 下市价单，指定持仓方向
             result = await self.binance_client.place_market_order(
                 symbol=order.symbol,
                 side=side,
                 quantity=quantity,
-                position_side=position_side,  # 指定持仓方向
-                reduce_only=True  # 只减仓模式，确保是平仓订单
+                position_side=position_side  # 指定持仓方向
             )
             
             logger.info(f"止损订单已执行: {result}")

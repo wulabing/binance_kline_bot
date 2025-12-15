@@ -170,7 +170,7 @@ class BinanceClient:
         return orders
 
     async def place_market_order(self, symbol: str, side: str, quantity: float, 
-                                  position_side: Optional[str] = None, reduce_only: bool = False) -> Dict:
+                                  position_side: Optional[str] = None) -> Dict:
         """下市价单
         
         Args:
@@ -178,7 +178,6 @@ class BinanceClient:
             side: 订单方向 (BUY 或 SELL)
             quantity: 数量
             position_side: 持仓方向 (LONG/SHORT/BOTH)，用于双向持仓模式
-            reduce_only: 是否只减仓（用于平仓）
         """
         params = {
             'symbol': symbol,
@@ -191,11 +190,7 @@ class BinanceClient:
         if position_side:
             params['positionSide'] = position_side
         
-        # 如果是平仓订单，设置只减仓模式
-        if reduce_only:
-            params['reduceOnly'] = 'true'
-        
-        logger.info(f"下市价单: {symbol} {side} {quantity} (positionSide={position_side}, reduceOnly={reduce_only})")
+        logger.info(f"下市价单: {symbol} {side} {quantity} (positionSide={position_side})")
         data = await self._request('POST', '/fapi/v1/order', signed=True, params=params)
         
         return {
