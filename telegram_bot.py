@@ -5,7 +5,7 @@ Telegram Bot 模块
 import asyncio
 import logging
 from typing import Dict, List, Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -119,9 +119,33 @@ class TelegramBot:
         # 初始化并启动
         await self.application.initialize()
         await self.application.start()
+        
+        # 设置 Bot 命令菜单
+        await self.set_bot_commands()
+        
         await self.application.updater.start_polling()
         
         logger.info("Telegram Bot 已启动")
+
+    async def set_bot_commands(self):
+        """设置 Bot 命令菜单"""
+        commands = [
+            BotCommand("start", "开始使用"),
+            BotCommand("help", "显示帮助信息"),
+            BotCommand("positions", "查看当前持仓"),
+            BotCommand("orders", "查看币安委托订单"),
+            BotCommand("stoplosses", "查看所有止损订单"),
+            BotCommand("addstoploss", "添加止损订单"),
+            BotCommand("updatestoploss", "更新止损订单"),
+            BotCommand("deletestoploss", "删除止损订单"),
+            BotCommand("cancel", "取消当前操作"),
+        ]
+        
+        try:
+            await self.application.bot.set_my_commands(commands)
+            logger.info("Bot 命令菜单已设置")
+        except Exception as e:
+            logger.error(f"设置 Bot 命令菜单失败: {e}")
 
     async def stop(self):
         """停止 Telegram Bot"""
