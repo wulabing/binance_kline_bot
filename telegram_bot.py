@@ -808,49 +808,131 @@ class TelegramBot:
     
     async def notify_position_update(self, position: Dict):
         """通知持仓更新（开仓或持仓变化）"""
+        # 根据方向选择emoji
+        side_icon = "🟢" if position['side'] == 'LONG' else "🔴"
+        side_text = "做多" if position['side'] == 'LONG' else "做空"
+        
+        # 根据盈亏选择emoji和颜色
+        pnl = float(position['unrealized_pnl'])
+        if pnl > 0:
+            pnl_icon = "💰"
+            pnl_text = f"+{pnl:.2f}"
+        elif pnl < 0:
+            pnl_icon = "📉"
+            pnl_text = f"{pnl:.2f}"
+        else:
+            pnl_icon = "➖"
+            pnl_text = f"{pnl:.2f}"
+        
         text = (
-            f"📊 持仓更新\n\n"
-            f"交易对: {position['symbol']}\n"
-            f"方向: {position['side']}\n"
-            f"数量: {position['position_amt']}\n"
-            f"开仓价: {position['entry_price']}\n"
-            f"未实现盈亏: {position['unrealized_pnl']:.2f} USDT"
+            f"{'═' * 25}\n"
+            f"📊 持仓更新通知\n"
+            f"{'═' * 25}\n\n"
+            f"🏷 交易对：{position['symbol']}\n"
+            f"{side_icon} 方向：{side_text} ({position['side']})\n"
+            f"📦 数量：{position['position_amt']}\n"
+            f"💵 开仓价：{position['entry_price']}\n"
+            f"⚖️ 杠杆：{position['leverage']}x\n"
+            f"{pnl_icon} 未实现盈亏：{pnl_text} USDT\n"
+            f"⚠️ 强平价：{position['liquidation_price']}\n"
+            f"{'─' * 25}"
         )
         await self.send_message(text)
 
     async def notify_position_closed(self, data: Dict):
         """通知平仓"""
+        # 根据方向选择emoji
+        side_icon = "🟢" if data['previous_side'] == 'LONG' else "🔴"
+        side_text = "做多" if data['previous_side'] == 'LONG' else "做空"
+        
         text = (
-            f"🔒 持仓已平仓\n\n"
-            f"交易对: {data['symbol']}\n"
-            f"方向: {data['previous_side']}\n"
-            f"数量: {data['previous_amount']}"
+            f"{'═' * 25}\n"
+            f"🔒 持仓平仓通知\n"
+            f"{'═' * 25}\n\n"
+            f"🏷 交易对：{data['symbol']}\n"
+            f"{side_icon} 方向：{side_text} ({data['previous_side']})\n"
+            f"📦 数量：{data['previous_amount']}\n\n"
+            f"✅ 该持仓已完全平仓\n"
+            f"{'─' * 25}"
         )
         await self.send_message(text)
 
     async def notify_order_update(self, order: Dict):
         """通知订单更新"""
         # 过滤订单状态，只通知重要的状态变化
-        # 跳过：NEW（新订单）和 PARTIALLY_FILLED（部分成交）
-        # 通知：FILLED（完全成交）、CANCELED（取消）、EXPIRED（过期）、REJECTED（拒绝）
+        # 跳过：PARTIALLY_FILLED（部分成交）
+        # 通知：NEW（新订单）、FILLED（完全成交）、CANCELED（取消）、EXPIRED（过期）、REJECTED（拒绝）
         status = order['status']
         
-        if status in ['NEW', 'PARTIALLY_FILLED']:
+        if status in ['PARTIALLY_FILLED']:
             # 不发送通知，避免太多噪音
             logger.debug(f"跳过订单状态通知: {order['symbol']} {status}")
             return
         
+        # 根据方向选择emoji
+        side_icon = "🟢" if order['side'] == 'BUY' else "🔴"
+        side_text_map = {
+            'BUY': '买入/做多',
+            'SELL': '卖出/做空'
+        }
+        side_text = side_text_map.get(order['side'], order['side'])
+        
+        # 根据订单类型选择emoji和描述
+        type_map = {
+            'MARKET': ('⚡', '市价单'),
+            'LIMIT': ('📌', '限价单'),
+            'STOP': ('🛑', '止损单'),
+            'STOP_MARKET': ('🛑', '止损市价单'),
+            'TAKE_PROFIT': ('🎯', '止盈单'),
+            'TAKE_PROFIT_MARKET': ('🎯', '止盈市价单'),
+        }
+        type_icon, type_text = type_map.get(order['type'], ('📋', order['type']))
+        
+        # 根据订单状态选择emoji和描述
+        status_map = {
+            'NEW': ('🆕', '已创建'),
+            'FILLED': ('✅', '已完全成交'),
+            'CANCELED': ('❌', '已取消'),
+            'EXPIRED': ('⏰', '已过期'),
+            'REJECTED': ('🚫', '已拒绝'),
+            'PARTIALLY_FILLED': ('⏳', '部分成交'),
+        }
+        status_icon, status_text = status_map.get(status, ('📋', status))
+        
+        # 构建消息
         text = (
-            f"📋 订单更新\n\n"
-            f"交易对: {order['symbol']}\n"
-            f"订单ID: {order['order_id']}\n"
-            f"方向: {order['side']}\n"
-            f"类型: {order['type']}\n"
-            f"状态: {order['status']}\n"
-            f"价格: {order['price']}\n"
-            f"数量: {order['quantity']}\n"
-            f"已成交: {order.get('executed_qty', 0)}"
+            f"{'═' * 25}\n"
+            f"📋 订单更新通知\n"
+            f"{'═' * 25}\n\n"
+            f"🏷 交易对：{order['symbol']}\n"
+            f"🆔 订单ID：{order['order_id']}\n"
+            f"{side_icon} 方向：{side_text}\n"
+            f"{type_icon} 类型：{type_text}\n"
+            f"{status_icon} 状态：{status_text}\n"
         )
+        
+        # 添加价格信息
+        if order.get('price') and float(order.get('price', 0)) > 0:
+            text += f"💵 价格：{order['price']}\n"
+        
+        # 添加触发价格（如果有）
+        if order.get('stop_price') and float(order['stop_price']) > 0:
+            text += f"🎯 触发价：{order['stop_price']}\n"
+        
+        # 添加数量信息
+        text += f"📦 数量：{order['quantity']}\n"
+        
+        # 添加已成交数量（如果有）
+        executed_qty = order.get('executed_qty', 0)
+        if executed_qty and float(executed_qty) > 0:
+            text += f"✓ 已成交：{executed_qty}\n"
+        
+        # 添加只减仓标识
+        if order.get('reduce_only'):
+            text += f"⚠️ 只减仓：是\n"
+        
+        text += f"{'─' * 25}"
+        
         await self.send_message(text)
 
     async def notify_stop_loss_triggered(self, data: Dict):
@@ -859,32 +941,46 @@ class TelegramBot:
         
         if action == 'executed':
             order = data['order']
+            # 根据方向选择emoji
+            side_icon = "🟢" if order['side'] == 'LONG' else "🔴"
+            side_text = "做多" if order['side'] == 'LONG' else "做空"
+            
             text = (
-                f"🛡️ 止损已执行！\n\n"
-                f"交易对: {order['symbol']}\n"
-                f"方向: {order['side']}\n"
-                f"触发价: {data['trigger_price']}\n"
-                f"止损价: {order['stop_price']}\n"
-                f"周期: {order['timeframe']}\n\n"
-                f"市价单已提交"
+                f"{'═' * 25}\n"
+                f"🛡️ 止损已触发执行！\n"
+                f"{'═' * 25}\n\n"
+                f"🏷 交易对：{order['symbol']}\n"
+                f"{side_icon} 方向：{side_text} ({order['side']})\n"
+                f"📊 触发价：{data['trigger_price']}\n"
+                f"🎯 止损价：{order['stop_price']}\n"
+                f"⏰ K线周期：{order['timeframe']}\n\n"
+                f"✅ 市价单已提交，等待成交\n"
+                f"{'─' * 25}"
             )
         elif action == 'failed':
             order = data['order']
             text = (
-                f"❌ 止损执行失败！\n\n"
-                f"交易对: {order['symbol']}\n"
-                f"错误: {data['error']}"
+                f"{'═' * 25}\n"
+                f"❌ 止损执行失败！\n"
+                f"{'═' * 25}\n\n"
+                f"🏷 交易对：{order['symbol']}\n"
+                f"⚠️ 错误信息：{data['error']}\n\n"
+                f"🔔 请手动检查持仓状态\n"
+                f"{'─' * 25}"
             )
         elif action == 'cleaned':
             deleted_count = data.get('deleted_count', 0)
             text = (
-                f"🧹 自动清理\n\n"
-                f"交易对: {data['symbol']}\n"
-                f"原因: {data['reason']}\n"
-                f"已删除止损订单: {deleted_count} 个"
+                f"{'═' * 25}\n"
+                f"🧹 自动清理通知\n"
+                f"{'═' * 25}\n\n"
+                f"🏷 交易对：{data['symbol']}\n"
+                f"📝 原因：{data['reason']}\n"
+                f"🗑️ 已删除止损订单：{deleted_count} 个\n"
+                f"{'─' * 25}"
             )
         else:
-            text = f"未知操作: {action}"
+            text = f"⚠️ 未知操作: {action}"
         
         await self.send_message(text)
 
