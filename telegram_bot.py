@@ -890,7 +890,7 @@ class TelegramBot:
         
         if status in ['PARTIALLY_FILLED']:
             # 不发送通知，避免太多噪音
-            logger.debug(f"跳过订单状态通知: {order['symbol']} {status}")
+            logger.info(f"跳过订单状态通知: {order['symbol']} {status}")
             return
         
         # 根据方向选择emoji

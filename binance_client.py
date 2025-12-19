@@ -342,16 +342,21 @@ class BinanceClient:
                     elif new_amt != 0:
                         # 检查是否是新的持仓或持仓数量有变化
                         if old_amt == 0 or abs(old_amt) != abs(new_amt):
-                            position_info = {
-                                'symbol': symbol,
-                                'side': 'LONG' if new_amt > 0 else 'SHORT',
-                                'position_amt': abs(new_amt),
-                                'entry_price': float(next((p['ep'] for p in positions if p['s'] == symbol), 0)),
-                                'unrealized_pnl': float(next((p['up'] for p in positions if p['s'] == symbol), 0))
-                            }
-                            
-                            if self.on_position_update:
-                                await self.on_position_update(position_info)
+                            # 获取对应的持仓数据
+                            pos_data = next((p for p in positions if p['s'] == symbol), None)
+                            if pos_data:
+                                position_info = {
+                                    'symbol': symbol,
+                                    'side': 'LONG' if new_amt > 0 else 'SHORT',
+                                    'position_amt': abs(new_amt),
+                                    'entry_price': float(pos_data.get('ep', 0)),
+                                    'unrealized_pnl': float(pos_data.get('up', 0)),
+                                    'leverage': int(pos_data.get('lv', 1)),  # 添加杠杆信息
+                                    'liquidation_price': float(pos_data.get('lp', 0))  # 添加强平价信息
+                                }
+                                
+                                if self.on_position_update:
+                                    await self.on_position_update(position_info)
                 
                 # 更新持仓缓存（只更新本次更新中提到的交易对）
                 for symbol, position_amt in current_positions.items():
@@ -377,6 +382,8 @@ class BinanceClient:
                 'price': float(order['p']),
                 'quantity': float(order['q']),
                 'executed_qty': float(order['z']),
+                'stop_price': float(order.get('sp', 0)),  # 添加止损触发价
+                'reduce_only': order.get('R', False),  # 添加只减仓标识
                 'time': data['E']
             }
             
