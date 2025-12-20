@@ -50,9 +50,10 @@ class StopLossManager:
         self.running = True
         
         # 立即初始化持仓缓存（避免监控任务启动时缓存为空）
+        # 使用 symbol_side 组合作为key，支持双向持仓
         try:
             positions = await self.binance_client.get_positions()
-            self.current_positions = {pos['symbol']: pos for pos in positions}
+            self.current_positions = {f"{pos['symbol']}_{pos['side']}": pos for pos in positions}
             logger.info(f"止损管理器持仓缓存初始化完成，当前持仓数: {len(positions)}")
         except Exception as e:
             logger.warning(f"初始化止损管理器持仓缓存失败: {e}")
@@ -88,29 +89,48 @@ class StopLossManager:
                     # 重置错误计数
                     consecutive_errors = 0
                     
-                    # 更新持仓缓存
-                    self.current_positions = {pos['symbol']: pos for pos in positions}
+                    # 更新持仓缓存（使用 symbol_side 组合作为key，支持双向持仓）
+                    self.current_positions = {f"{pos['symbol']}_{pos['side']}": pos for pos in positions}
                     
                     # 获取数据库中所有的止损订单
                     all_stop_losses = self.database.get_all_stop_losses()
                     
-                    # 收集需要清理的交易对（去重，避免同一交易对的多个订单重复处理）
-                    symbols_to_clean = set()
-                    for order in all_stop_losses:
-                        if order.symbol not in self.current_positions:
-                            symbols_to_clean.add(order.symbol)
+                    # 创建当前持仓的key集合（symbol_side组合）
+                    current_position_keys = set(self.current_positions.keys())
                     
-                    # 对每个需要清理的交易对，删除订单并发送通知
-                    for symbol in symbols_to_clean:
-                        # 删除该交易对的所有止损订单
-                        deleted_count = self.database.delete_stop_losses_by_symbol(symbol)
+                    # 收集需要清理的订单（去重，避免同一交易对的多个订单重复处理）
+                    orders_to_clean = []
+                    for order in all_stop_losses:
+                        order_key = f"{order.symbol}_{order.side}"
+                        if order_key not in current_position_keys:
+                            orders_to_clean.append(order)
+                    
+                    # 按交易对+方向分组统计
+                    cleaned_positions = {}
+                    for order in orders_to_clean:
+                        order_key = f"{order.symbol}_{order.side}"
+                        if order_key not in cleaned_positions:
+                            cleaned_positions[order_key] = {'symbol': order.symbol, 'side': order.side, 'count': 0}
+                        cleaned_positions[order_key]['count'] += 1
+                    
+                    # 对每个需要清理的持仓方向，删除订单并发送通知
+                    for position_key, info in cleaned_positions.items():
+                        # 删除该交易对+方向的所有止损订单
+                        # 注意：需要修改数据库删除方法以支持按方向删除
+                        deleted_count = 0
+                        for order in all_stop_losses:
+                            if order.symbol == info['symbol'] and order.side == info['side']:
+                                if self.database.delete_stop_loss(order.id):
+                                    deleted_count += 1
+                        
                         if deleted_count > 0:
-                            logger.info(f"清理已平仓交易对 {symbol} 的 {deleted_count} 个止损订单")
+                            logger.info(f"清理已平仓持仓 {info['symbol']} {info['side']} 的 {deleted_count} 个止损订单")
                             
                             if self.on_stop_loss_triggered:
                                 await self.on_stop_loss_triggered({
                                     'action': 'cleaned',
-                                    'symbol': symbol,
+                                    'symbol': info['symbol'],
+                                    'side': info['side'],
                                     'reason': '仓位已不存在',
                                     'deleted_count': deleted_count
                                 })
@@ -184,9 +204,10 @@ class StopLossManager:
                     logger.info(f"停止监控 {symbol} [{timeframe}]，无止损订单")
                     break
                 
-                # 检查是否有持仓
-                if symbol not in self.current_positions:
-                    logger.info(f"停止监控 {symbol} [{timeframe}]，无持仓")
+                # 检查是否有持仓（使用 symbol_side 组合检查）
+                position_key = f"{symbol}_{orders[0].side}"
+                if position_key not in self.current_positions:
+                    logger.info(f"停止监控 {symbol} [{timeframe}] {orders[0].side}，无持仓")
                     break
                 
                 try:
@@ -264,10 +285,11 @@ class StopLossManager:
         """检查止损是否触发"""
         triggered = False
         
-        # 获取持仓信息
-        position = self.current_positions.get(order.symbol)
+        # 获取持仓信息（使用 symbol_side 组合）
+        position_key = f"{order.symbol}_{order.side}"
+        position = self.current_positions.get(position_key)
         if not position:
-            logger.warning(f"止损订单 {order.id} 对应的持仓不存在: {order.symbol}")
+            logger.warning(f"止损订单 {order.id} 对应的持仓不存在: {order.symbol} {order.side}")
             return
         
         # 判断是否触发止损
@@ -359,14 +381,16 @@ class StopLossManager:
     async def _collect_evaluation(self, symbol: str, timeframe: str, close_price: float, orders: List[StopLossOrder]):
         """收集评估信息"""
         try:
-            # 获取持仓信息
-            position = self.current_positions.get(symbol)
-            if not position:
-                return
-            
             # 为每个订单评估是否应该执行止损
             evaluations = []
             for order in orders:
+                # 获取对应方向的持仓信息（使用 symbol_side 组合）
+                position_key = f"{symbol}_{order.side}"
+                position = self.current_positions.get(position_key)
+                if not position:
+                    # 如果持仓不存在，跳过此订单的评估
+                    continue
+                
                 should_trigger = False
                 
                 # 判断是否应该触发止损
@@ -385,6 +409,10 @@ class StopLossManager:
                     'should_trigger': should_trigger,
                     'order_id': order.id
                 })
+            
+            # 如果没有有效的评估信息，直接返回
+            if not evaluations:
+                return
             
             # 按周期分组存储评估信息
             if timeframe not in self.pending_evaluations:
@@ -441,22 +469,23 @@ class StopLossManager:
         """添加止损订单"""
         # 实时获取持仓以确保数据最新
         positions = await self.binance_client.get_positions()
-        position_dict = {pos['symbol']: pos for pos in positions}
+        position_dict = {f"{pos['symbol']}_{pos['side']}": pos for pos in positions}
         
-        # 检查持仓是否存在
-        if symbol not in position_dict:
-            raise ValueError(f"交易对 {symbol} 没有持仓")
+        # 检查持仓是否存在（使用 symbol_side 组合）
+        position_key = f"{symbol}_{side}"
+        if position_key not in position_dict:
+            raise ValueError(f"交易对 {symbol} 的 {side} 方向没有持仓")
         
-        position = position_dict[symbol]
+        position = position_dict[position_key]
         
-        # 验证止损方向
+        # 验证止损方向（双向持仓下，side应该直接匹配）
         if position['side'] != side:
             raise ValueError(f"持仓方向不匹配: 持仓为 {position['side']}，止损为 {side}")
         
         # 添加到数据库
         order_id = self.database.add_stop_loss(symbol, side, stop_price, timeframe, quantity)
         
-        logger.info(f"添加止损订单成功: ID {order_id}")
+        logger.info(f"添加止损订单成功: ID {order_id}, {symbol} {side} @ {stop_price} [{timeframe}]")
         
         return order_id
 

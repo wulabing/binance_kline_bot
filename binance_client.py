@@ -37,7 +37,8 @@ class BinanceClient:
         self.running = False
         
         # 持仓缓存，用于检测持仓变化（开仓/平仓）
-        self.position_cache = {}  # {symbol: position_amt}
+        # 双向持仓模式：{symbol_side: position_amt}
+        self.position_cache = {}  # {f"{symbol}_{side}": position_amt}
         
         # 回调函数
         self.on_position_update = None
@@ -124,17 +125,29 @@ class BinanceClient:
                 logger.error(f"Keep alive 任务错误: {e}")
 
     async def get_positions(self) -> List[Dict]:
-        """获取当前所有持仓"""
+        """获取当前所有持仓
+        
+        注意：在双向持仓模式下，API会为每个交易对返回LONG和SHORT两条记录
+        我们需要过滤出实际有持仓的记录（positionAmt != 0）
+        """
         data = await self._request('GET', '/fapi/v2/positionRisk', signed=True)
         
-        # 过滤出有持仓的交易对
+        # 过滤出有持仓的交易对（支持双向持仓）
         positions = []
         for pos in data:
             position_amt = float(pos['positionAmt'])
+            # 双向持仓模式下，API会返回每个方向的记录，只保留实际有持仓的
             if position_amt != 0:
+                # 获取持仓方向（双向持仓模式下API会直接返回positionSide字段）
+                position_side = pos.get('positionSide', 'BOTH')
+                
+                # 如果API没有返回positionSide（单向持仓模式），根据数量判断
+                if position_side == 'BOTH':
+                    position_side = 'LONG' if position_amt > 0 else 'SHORT'
+                
                 positions.append({
                     'symbol': pos['symbol'],
-                    'side': 'LONG' if position_amt > 0 else 'SHORT',
+                    'side': position_side,  # LONG 或 SHORT
                     'position_amt': abs(position_amt),
                     'entry_price': float(pos['entryPrice']),
                     'unrealized_pnl': float(pos['unRealizedProfit']),
@@ -316,25 +329,39 @@ class BinanceClient:
                     return
                 
                 # 创建当前持仓快照（只包含本次更新中明确提到的交易对）
+                # 支持双向持仓：使用 symbol_side 作为key
                 current_positions = {}
                 for pos in positions:
                     symbol = pos['s']
                     position_amt = float(pos['pa'])
-                    current_positions[symbol] = position_amt
+                    # 获取持仓方向（双向持仓模式下API会返回ps字段）
+                    position_side = pos.get('ps', 'BOTH')
+                    
+                    # 如果是单向持仓模式（BOTH），根据数量判断方向
+                    if position_side == 'BOTH':
+                        position_side = 'LONG' if position_amt > 0 else 'SHORT'
+                    
+                    position_key = f"{symbol}_{position_side}"
+                    current_positions[position_key] = {
+                        'amt': position_amt,
+                        'side': position_side,
+                        'data': pos
+                    }
                 
-                # 只检查本次更新中明确提到的交易对（避免误判）
-                # 对于本次更新中提到的交易对，检查持仓变化
-                for symbol in current_positions.keys():
-                    old_amt = self.position_cache.get(symbol, 0.0)
-                    new_amt = current_positions[symbol]
+                # 只检查本次更新中明确提到的交易对+方向（避免误判）
+                for position_key, pos_info in current_positions.items():
+                    old_amt = self.position_cache.get(position_key, 0.0)
+                    new_amt = pos_info['amt']
+                    position_side = pos_info['side']
+                    symbol = position_key.rsplit('_', 1)[0]
                     
                     # 检测平仓：从非0变为0
                     if old_amt != 0 and new_amt == 0:
-                        logger.info(f"检测到平仓: {symbol} (从 {old_amt} 变为 0)")
+                        logger.info(f"检测到平仓: {symbol} {position_side} (从 {old_amt} 变为 0)")
                         if self.on_position_closed:
                             await self.on_position_closed({
                                 'symbol': symbol,
-                                'previous_side': 'LONG' if old_amt > 0 else 'SHORT',
+                                'previous_side': position_side,
                                 'previous_amount': abs(old_amt)
                             })
                     
@@ -342,30 +369,29 @@ class BinanceClient:
                     elif new_amt != 0:
                         # 检查是否是新的持仓或持仓数量有变化
                         if old_amt == 0 or abs(old_amt) != abs(new_amt):
-                            # 获取对应的持仓数据
-                            pos_data = next((p for p in positions if p['s'] == symbol), None)
-                            if pos_data:
-                                position_info = {
-                                    'symbol': symbol,
-                                    'side': 'LONG' if new_amt > 0 else 'SHORT',
-                                    'position_amt': abs(new_amt),
-                                    'entry_price': float(pos_data.get('ep', 0)),
-                                    'unrealized_pnl': float(pos_data.get('up', 0)),
-                                    'leverage': int(pos_data.get('lv', 1)),  # 添加杠杆信息
-                                    'liquidation_price': float(pos_data.get('lp', 0))  # 添加强平价信息
-                                }
-                                
-                                if self.on_position_update:
-                                    await self.on_position_update(position_info)
+                            pos_data = pos_info['data']
+                            position_info = {
+                                'symbol': symbol,
+                                'side': position_side,
+                                'position_amt': abs(new_amt),
+                                'entry_price': float(pos_data.get('ep', 0)),
+                                'unrealized_pnl': float(pos_data.get('up', 0)),
+                                'leverage': int(pos_data.get('lv', 1)),  # 添加杠杆信息
+                                'liquidation_price': float(pos_data.get('lp', 0))  # 添加强平价信息
+                            }
+                            
+                            if self.on_position_update:
+                                await self.on_position_update(position_info)
                 
-                # 更新持仓缓存（只更新本次更新中提到的交易对）
-                for symbol, position_amt in current_positions.items():
+                # 更新持仓缓存（只更新本次更新中提到的交易对+方向）
+                for position_key, pos_info in current_positions.items():
+                    position_amt = pos_info['amt']
                     if position_amt == 0:
                         # 如果持仓变为0，从缓存中删除
-                        self.position_cache.pop(symbol, None)
+                        self.position_cache.pop(position_key, None)
                     else:
                         # 否则更新缓存
-                        self.position_cache[symbol] = position_amt
+                        self.position_cache[position_key] = position_amt
             
             if self.on_account_update:
                 await self.on_account_update(data)

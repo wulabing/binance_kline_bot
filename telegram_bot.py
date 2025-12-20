@@ -994,11 +994,16 @@ class TelegramBot:
             )
         elif action == 'cleaned':
             deleted_count = data.get('deleted_count', 0)
+            side = data.get('side', '')
+            side_icon = "🟢" if side == 'LONG' else "🔴"
+            side_text = "做多" if side == 'LONG' else "做空"
+            
             text = (
                 f"{'═' * 25}\n"
                 f"🧹 自动清理通知\n"
                 f"{'═' * 25}\n\n"
                 f"🏷 交易对：{data['symbol']}\n"
+                f"{side_icon} 方向：{side_text} ({side})\n"
                 f"📝 原因：{data['reason']}\n"
                 f"🗑️ 已删除止损订单：{deleted_count} 个\n"
                 f"{'─' * 25}"

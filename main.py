@@ -190,13 +190,15 @@ class TradingBot:
             await self.stop()
 
     async def initialize_position_cache(self):
-        """初始化持仓缓存"""
+        """初始化持仓缓存（支持双向持仓）"""
         try:
             positions = await self.binance_client.get_positions()
             for pos in positions:
                 # 根据方向设置正负值
                 position_amt = pos['position_amt'] if pos['side'] == 'LONG' else -pos['position_amt']
-                self.binance_client.position_cache[pos['symbol']] = position_amt
+                # 使用 symbol_side 组合作为key
+                position_key = f"{pos['symbol']}_{pos['side']}"
+                self.binance_client.position_cache[position_key] = position_amt
             logger.info(f"持仓缓存初始化完成，当前持仓数: {len(positions)}")
         except Exception as e:
             logger.warning(f"初始化持仓缓存失败: {e}")
