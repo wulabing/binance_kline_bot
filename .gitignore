@@ -11,4 +11,4 @@ venv/
 .pid
 nohup.out
 .binance-telegram-venv/
-
+test*.py

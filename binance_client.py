@@ -40,6 +40,13 @@ class BinanceClient:
         # 双向持仓模式：{symbol_side: position_amt}
         self.position_cache = {}  # {f"{symbol}_{side}": position_amt}
         
+        # 订单缓存，用于检测新订单（避免 WebSocket 重连时错过）
+        self.order_cache = {}  # {order_id: order_info}
+        
+        # WebSocket 连接状态
+        self.ws_connected = False
+        self.last_ws_message_time = 0
+        
         # 回调函数
         self.on_position_update = None
         self.on_position_closed = None  # 平仓回调
@@ -265,20 +272,26 @@ class BinanceClient:
                     close_timeout=10   # 关闭超时10秒
                 ) as ws:
                     self.ws_connection = ws
+                    self.ws_connected = True
                     logger.info("WebSocket 用户数据流已连接")
                     
                     # 连接成功，重置重连延迟
                     reconnect_delay = 5
                     
+                    # WebSocket 重连后，检查是否有新订单（防止重连期间错过订单）
+                    asyncio.create_task(self._check_missed_orders())
+                    
                     async for message in ws:
                         if not self.running:
                             break
                         data = json.loads(message)
+                        self.last_ws_message_time = time.time()
                         await self._handle_user_data(data)
                         
             except websockets.ConnectionClosed as e:
                 if not self.running:
                     break
+                self.ws_connected = False
                 logger.warning(f"WebSocket 连接断开 (code: {e.code}, reason: {e.reason})，{reconnect_delay}秒后重连...")
                 await asyncio.sleep(reconnect_delay)
                 # 指数退避，但不超过最大延迟
@@ -290,6 +303,7 @@ class BinanceClient:
             except Exception as e:
                 if not self.running:
                     break
+                self.ws_connected = False
                 logger.error(f"WebSocket 错误: {e}", exc_info=True)
                 logger.info(f"{reconnect_delay}秒后重连...")
                 await asyncio.sleep(reconnect_delay)
@@ -300,6 +314,70 @@ class BinanceClient:
                 self.listen_key = None
         
         logger.info("WebSocket 用户数据流已停止")
+
+    async def _check_missed_orders(self):
+        """检查 WebSocket 重连期间是否错过了新订单
+        
+        在 WebSocket 重连后调用，对比当前的订单列表和缓存，
+        如果发现新订单则发送通知
+        """
+        try:
+            # 等待一小段时间，让 WebSocket 稳定
+            await asyncio.sleep(2)
+            
+            if not self.ws_connected:
+                return
+            
+            logger.info("检查 WebSocket 重连期间是否有新订单...")
+            
+            # 获取当前所有委托订单
+            current_orders = await self.get_open_orders()
+            
+            # 检查是否有新订单（在缓存中不存在的订单）
+            new_orders = []
+            for order in current_orders:
+                order_id = order['order_id']
+                if order_id not in self.order_cache:
+                    new_orders.append(order)
+                    # 更新缓存
+                    self.order_cache[order_id] = order
+            
+            # 如果发现新订单，发送通知
+            if new_orders:
+                logger.info(f"发现 {len(new_orders)} 个新订单（WebSocket 重连期间创建）")
+                for order in new_orders:
+                    if self.on_order_update:
+                        # 构建订单信息，格式与 WebSocket 推送一致
+                        order_info = {
+                            'symbol': order['symbol'],
+                            'order_id': order['order_id'],
+                            'side': order['side'],
+                            'type': order['type'],
+                            'status': order['status'],
+                            'price': order['price'],
+                            'quantity': order['quantity'],
+                            'executed_qty': 0.0,  # 从 REST API 无法获取已成交数量，默认为0
+                            'stop_price': order.get('stop_price', 0.0),
+                            'reduce_only': order.get('reduce_only', False),
+                            'time': order['time']
+                        }
+                        await self.on_order_update(order_info)
+            else:
+                logger.info("未发现新订单")
+                
+            # 清理缓存中已经不存在的订单
+            current_order_ids = {order['order_id'] for order in current_orders}
+            cached_order_ids = set(self.order_cache.keys())
+            closed_order_ids = cached_order_ids - current_order_ids
+            
+            for order_id in closed_order_ids:
+                del self.order_cache[order_id]
+            
+            if closed_order_ids:
+                logger.info(f"清理了 {len(closed_order_ids)} 个已完成的订单缓存")
+                
+        except Exception as e:
+            logger.error(f"检查错过的订单时出错: {e}", exc_info=True)
 
     async def _handle_user_data(self, data: Dict):
         """处理用户数据流消息"""
@@ -414,6 +492,17 @@ class BinanceClient:
             }
             
             logger.info(f"订单更新: {order_info['symbol']} {order_info['side']} {order_info['status']}")
+            
+            # 更新订单缓存
+            order_id = order_info['order_id']
+            status = order_info['status']
+            
+            if status == 'NEW':
+                # 新订单，添加到缓存
+                self.order_cache[order_id] = order_info
+            elif status in ['FILLED', 'CANCELED', 'EXPIRED', 'REJECTED']:
+                # 订单已完成，从缓存中删除
+                self.order_cache.pop(order_id, None)
             
             if self.on_order_update:
                 await self.on_order_update(order_info)

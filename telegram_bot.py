@@ -4,6 +4,7 @@ Telegram Bot 模块
 """
 import asyncio
 import logging
+import time
 from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
@@ -39,6 +40,12 @@ class TelegramBot:
         
         # 临时存储用户输入
         self.user_data_cache = {}
+        
+        # 消息发送失败计数器和健康检查
+        self.failed_send_count = 0
+        self.last_successful_send = time.time()
+        self.health_check_interval = 300  # 5分钟检查一次
+        self.health_check_task = None
 
     async def start(self):
         """启动 Telegram Bot"""
@@ -125,7 +132,10 @@ class TelegramBot:
         
         await self.application.updater.start_polling()
         
-        logger.info("Telegram Bot 已启动")
+        # 启动健康检查任务
+        self.health_check_task = asyncio.create_task(self._health_check_loop())
+        
+        logger.info("Telegram Bot 已启动（含健康检查）")
 
     async def set_bot_commands(self):
         """设置 Bot 命令菜单"""
@@ -147,27 +157,152 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"设置 Bot 命令菜单失败: {e}")
 
+    async def _reinitialize_connection(self):
+        """重新初始化 Telegram Bot 连接
+        
+        当发送消息多次失败时调用此方法重新建立连接
+        """
+        try:
+            logger.info("正在重新初始化 Telegram Bot 连接...")
+            
+            # 不关闭整个 application，只重新创建 bot 的 HTTP 客户端
+            if self.application and self.application.bot:
+                # 关闭旧的 HTTP 客户端
+                try:
+                    if hasattr(self.application.bot, '_request') and self.application.bot._request:
+                        await self.application.bot._request.shutdown()
+                except Exception as e:
+                    logger.warning(f"关闭旧连接时出错: {e}")
+                
+                # 重新创建请求对象
+                from telegram.request import HTTPXRequest
+                new_request = HTTPXRequest(
+                    connection_pool_size=8,
+                    connect_timeout=30.0,
+                    read_timeout=30.0,
+                    write_timeout=30.0,
+                    pool_timeout=30.0
+                )
+                
+                # 更新 bot 的请求对象
+                self.application.bot._request = new_request
+                
+                logger.info("Telegram Bot 连接重新初始化成功")
+                
+        except Exception as e:
+            logger.error(f"重新初始化 Telegram Bot 连接失败: {e}", exc_info=True)
+            raise
+
+    async def _health_check_loop(self):
+        """定期健康检查任务
+        
+        每隔一段时间检查连接健康状态，如果发现异常则主动重新初始化
+        """
+        while True:
+            try:
+                await asyncio.sleep(self.health_check_interval)
+                
+                # 检查上次成功发送消息的时间
+                time_since_last_success = time.time() - self.last_successful_send
+                
+                # 如果连续失败次数过多，或者很久没有成功发送过消息
+                if self.failed_send_count >= 5:
+                    logger.warning(
+                        f"检测到连续 {self.failed_send_count} 次发送失败，"
+                        f"执行主动健康检查..."
+                    )
+                    try:
+                        # 尝试发送测试消息
+                        test_message = "🔍 系统健康检查"
+                        await self.application.bot.send_message(
+                            chat_id=self.chat_id,
+                            text=test_message,
+                            read_timeout=10,
+                            write_timeout=10,
+                            connect_timeout=10
+                        )
+                        logger.info("健康检查通过，连接正常")
+                        self.failed_send_count = 0
+                        self.last_successful_send = time.time()
+                    except Exception as e:
+                        logger.error(f"健康检查失败: {e}")
+                        # 尝试重新初始化连接
+                        await self._reinitialize_connection()
+                        
+            except asyncio.CancelledError:
+                logger.info("健康检查任务已取消")
+                break
+            except Exception as e:
+                logger.error(f"健康检查任务错误: {e}", exc_info=True)
+
     async def stop(self):
         """停止 Telegram Bot"""
+        # 取消健康检查任务
+        if self.health_check_task:
+            self.health_check_task.cancel()
+            try:
+                await self.health_check_task
+            except asyncio.CancelledError:
+                pass
+        
         if self.application:
             await self.application.updater.stop()
             await self.application.stop()
             await self.application.shutdown()
         logger.info("Telegram Bot 已停止")
 
-    async def send_message(self, text: str, retry_count: int = 3):
-        """发送消息到指定的 chat，带重试机制"""
+    async def send_message(self, text: str, retry_count: int = 10):
+        """发送消息到指定的 chat，带增强重试机制和自动恢复
+        
+        Args:
+            text: 要发送的消息文本
+            retry_count: 重试次数（默认10次）
+        """
         for attempt in range(retry_count):
             try:
-                await self.application.bot.send_message(chat_id=self.chat_id, text=text)
-                return  # 发送成功，退出
+                # 检查 application 是否存在
+                if self.application is None:
+                    logger.error("Telegram application 未初始化")
+                    return
+                
+                await self.application.bot.send_message(
+                    chat_id=self.chat_id, 
+                    text=text,
+                    read_timeout=30,  # 增加读超时
+                    write_timeout=30,  # 增加写超时
+                    connect_timeout=30  # 增加连接超时
+                )
+                
+                # 发送成功，更新计数器和时间戳
+                self.failed_send_count = 0
+                self.last_successful_send = time.time()
+                logger.debug(f"消息发送成功: {text[:50]}...")
+                return
+                
             except Exception as e:
-                logger.error(f"发送消息失败 (尝试 {attempt + 1}/{retry_count}): {e}")
+                self.failed_send_count += 1
+                error_type = type(e).__name__
+                logger.error(f"发送消息失败 (尝试 {attempt + 1}/{retry_count}): {error_type} - {e}")
+                
                 if attempt < retry_count - 1:
-                    # 等待一段时间后重试（指数退避）
-                    await asyncio.sleep(2 ** attempt)
+                    # 指数退避，但最多等待30秒
+                    wait_time = min(2 ** attempt, 30)
+                    logger.info(f"等待 {wait_time} 秒后重试...")
+                    await asyncio.sleep(wait_time)
+                    
+                    # 如果连续失败3次，尝试重新初始化连接
+                    if (attempt + 1) % 3 == 0:
+                        logger.warning(f"连续失败 {attempt + 1} 次，尝试重新初始化 Telegram 连接...")
+                        try:
+                            await self._reinitialize_connection()
+                        except Exception as reinit_error:
+                            logger.error(f"重新初始化连接失败: {reinit_error}")
                 else:
-                    logger.error(f"发送消息最终失败，已重试 {retry_count} 次")
+                    logger.error(
+                        f"发送消息最终失败，已重试 {retry_count} 次\n"
+                        f"消息内容: {text[:100]}...\n"
+                        f"连续失败次数: {self.failed_send_count}"
+                    )
 
     # ==================== 命令处理器 ====================
     

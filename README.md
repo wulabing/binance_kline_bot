@@ -46,7 +46,12 @@ db_path = trading_data.db
 ## 运行
 
 ```bash
-python main.py
+bash start.sh
+```
+## 停止
+
+```bash
+bash stop.sh
 ```
 
 ## Telegram 命令

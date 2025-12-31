@@ -165,6 +165,9 @@ class TradingBot:
             # 初始化持仓缓存（避免首次更新时误判为开仓）
             await self.initialize_position_cache()
             
+            # 初始化订单缓存（避免启动时误判为新订单）
+            await self.initialize_order_cache()
+            
             # 启动币安 WebSocket 用户数据流
             asyncio.create_task(self.binance_client.start_user_data_stream())
             
@@ -202,6 +205,17 @@ class TradingBot:
             logger.info(f"持仓缓存初始化完成，当前持仓数: {len(positions)}")
         except Exception as e:
             logger.warning(f"初始化持仓缓存失败: {e}")
+    
+    async def initialize_order_cache(self):
+        """初始化订单缓存，避免启动时误判为新订单"""
+        try:
+            orders = await self.binance_client.get_open_orders()
+            for order in orders:
+                order_id = order['order_id']
+                self.binance_client.order_cache[order_id] = order
+            logger.info(f"订单缓存初始化完成，当前委托订单数: {len(orders)}")
+        except Exception as e:
+            logger.warning(f"初始化订单缓存失败: {e}")
 
     async def send_startup_info(self):
         """发送启动信息"""
