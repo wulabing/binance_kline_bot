@@ -42,6 +42,7 @@ class BinanceClient:
         
         # 订单缓存，用于检测新订单（避免 WebSocket 重连时错过）
         self.order_cache = {}  # {order_id: order_info}
+        self.order_cache_lock = asyncio.Lock()  # 保护订单缓存的并发访问
         
         # WebSocket 连接状态
         self.ws_connected = False
@@ -333,16 +334,29 @@ class BinanceClient:
             # 获取当前所有委托订单
             current_orders = await self.get_open_orders()
             
-            # 检查是否有新订单（在缓存中不存在的订单）
-            new_orders = []
-            for order in current_orders:
-                order_id = order['order_id']
-                if order_id not in self.order_cache:
-                    new_orders.append(order)
-                    # 更新缓存
-                    self.order_cache[order_id] = order
+            # 使用锁保护订单缓存的访问，避免与 WebSocket 消息处理并发冲突
+            async with self.order_cache_lock:
+                # 检查是否有新订单（在缓存中不存在的订单）
+                new_orders = []
+                for order in current_orders:
+                    order_id = order['order_id']
+                    if order_id not in self.order_cache:
+                        new_orders.append(order)
+                        # 更新缓存
+                        self.order_cache[order_id] = order
+                
+                # 清理缓存中已经不存在的订单
+                current_order_ids = {order['order_id'] for order in current_orders}
+                cached_order_ids = set(self.order_cache.keys())
+                closed_order_ids = cached_order_ids - current_order_ids
+                
+                for order_id in closed_order_ids:
+                    del self.order_cache[order_id]
+                
+                if closed_order_ids:
+                    logger.info(f"清理了 {len(closed_order_ids)} 个已完成的订单缓存")
             
-            # 如果发现新订单，发送通知
+            # 在锁外发送通知，避免阻塞其他操作
             if new_orders:
                 logger.info(f"发现 {len(new_orders)} 个新订单（WebSocket 重连期间创建）")
                 for order in new_orders:
@@ -364,17 +378,6 @@ class BinanceClient:
                         await self.on_order_update(order_info)
             else:
                 logger.info("未发现新订单")
-                
-            # 清理缓存中已经不存在的订单
-            current_order_ids = {order['order_id'] for order in current_orders}
-            cached_order_ids = set(self.order_cache.keys())
-            closed_order_ids = cached_order_ids - current_order_ids
-            
-            for order_id in closed_order_ids:
-                del self.order_cache[order_id]
-            
-            if closed_order_ids:
-                logger.info(f"清理了 {len(closed_order_ids)} 个已完成的订单缓存")
                 
         except Exception as e:
             logger.error(f"检查错过的订单时出错: {e}", exc_info=True)
@@ -493,18 +496,28 @@ class BinanceClient:
             
             logger.info(f"订单更新: {order_info['symbol']} {order_info['side']} {order_info['status']}")
             
-            # 更新订单缓存
+            # 使用锁保护订单缓存的访问，避免与 _check_missed_orders() 并发冲突
             order_id = order_info['order_id']
             status = order_info['status']
+            should_notify = True
             
-            if status == 'NEW':
-                # 新订单，添加到缓存
-                self.order_cache[order_id] = order_info
-            elif status in ['FILLED', 'CANCELED', 'EXPIRED', 'REJECTED']:
-                # 订单已完成，从缓存中删除
-                self.order_cache.pop(order_id, None)
+            async with self.order_cache_lock:
+                if status == 'NEW':
+                    # 新订单，检查是否已在缓存中（可能已被 _check_missed_orders() 处理）
+                    if order_id in self.order_cache:
+                        # 订单已在缓存中，说明已被 _check_missed_orders() 处理过
+                        # 不需要重复通知
+                        should_notify = False
+                        logger.debug(f"订单 {order_id} 已在缓存中，跳过重复通知")
+                    else:
+                        # 新订单，添加到缓存
+                        self.order_cache[order_id] = order_info
+                elif status in ['FILLED', 'CANCELED', 'EXPIRED', 'REJECTED']:
+                    # 订单已完成，从缓存中删除
+                    self.order_cache.pop(order_id, None)
             
-            if self.on_order_update:
+            # 只在需要时发送通知
+            if should_notify and self.on_order_update:
                 await self.on_order_update(order_info)
 
     async def close(self):
@@ -527,4 +540,3 @@ class BinanceClient:
         await asyncio.sleep(0.5)
         
         logger.info("币安客户端已关闭")
-
