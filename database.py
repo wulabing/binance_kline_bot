@@ -43,193 +43,183 @@ class Database:
         self.init_database()
 
     def get_connection(self):
-        """获取数据库连接"""
-        conn = sqlite3.connect(self.db_path)
+        """获取数据库连接（启用 WAL 模式提升并发性能）"""
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
     def init_database(self):
         """初始化数据库表"""
         conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        # 创建止损订单表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS stop_loss_orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                stop_price REAL NOT NULL,
-                timeframe TEXT NOT NULL,
-                quantity REAL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # 创建索引
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_symbol ON stop_loss_orders(symbol)
-        ''')
-        
-        conn.commit()
-        conn.close()
-        logger.info("数据库初始化完成")
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS stop_loss_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    stop_price REAL NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    quantity REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_symbol ON stop_loss_orders(symbol)
+            ''')
+            conn.commit()
+            logger.info("数据库初始化完成")
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"数据库初始化失败: {e}")
+            raise
+        finally:
+            conn.close()
 
-    def add_stop_loss(self, symbol: str, side: str, stop_price: float, 
+    def add_stop_loss(self, symbol: str, side: str, stop_price: float,
                      timeframe: str, quantity: Optional[float] = None) -> int:
         """添加止损订单"""
         conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO stop_loss_orders (symbol, side, stop_price, timeframe, quantity)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (symbol, side, stop_price, timeframe, quantity))
-        
-        order_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        
-        logger.info(f"添加止损订单: {symbol} {side} @ {stop_price} [{timeframe}]")
-        return order_id
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO stop_loss_orders (symbol, side, stop_price, timeframe, quantity)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (symbol, side, stop_price, timeframe, quantity))
+            order_id = cursor.lastrowid
+            conn.commit()
+            logger.info(f"添加止损订单: {symbol} {side} @ {stop_price} [{timeframe}]")
+            return order_id
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"添加止损订单失败: {e}")
+            raise
+        finally:
+            conn.close()
 
     def get_stop_loss_by_id(self, order_id: int) -> Optional[StopLossOrder]:
         """根据ID获取止损订单"""
         conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT * FROM stop_loss_orders WHERE id = ?', (order_id,))
-        row = cursor.fetchone()
-        conn.close()
-        
-        if row:
-            return StopLossOrder(
-                id=row['id'],
-                symbol=row['symbol'],
-                side=row['side'],
-                stop_price=row['stop_price'],
-                timeframe=row['timeframe'],
-                quantity=row['quantity'],
-                created_at=row['created_at'],
-                updated_at=row['updated_at']
-            )
-        return None
+        try:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM stop_loss_orders WHERE id = ?', (order_id,))
+            row = cursor.fetchone()
+            if row:
+                return StopLossOrder(
+                    id=row['id'], symbol=row['symbol'], side=row['side'],
+                    stop_price=row['stop_price'], timeframe=row['timeframe'],
+                    quantity=row['quantity'], created_at=row['created_at'],
+                    updated_at=row['updated_at']
+                )
+            return None
+        finally:
+            conn.close()
 
     def get_stop_losses_by_symbol(self, symbol: str) -> List[StopLossOrder]:
         """获取指定交易对的所有止损订单"""
         conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT * FROM stop_loss_orders WHERE symbol = ?', (symbol,))
-        rows = cursor.fetchall()
-        conn.close()
-        
-        orders = []
-        for row in rows:
-            orders.append(StopLossOrder(
-                id=row['id'],
-                symbol=row['symbol'],
-                side=row['side'],
-                stop_price=row['stop_price'],
-                timeframe=row['timeframe'],
-                quantity=row['quantity'],
-                created_at=row['created_at'],
+        try:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM stop_loss_orders WHERE symbol = ?', (symbol,))
+            rows = cursor.fetchall()
+            return [StopLossOrder(
+                id=row['id'], symbol=row['symbol'], side=row['side'],
+                stop_price=row['stop_price'], timeframe=row['timeframe'],
+                quantity=row['quantity'], created_at=row['created_at'],
                 updated_at=row['updated_at']
-            ))
-        
-        return orders
+            ) for row in rows]
+        finally:
+            conn.close()
 
     def get_all_stop_losses(self) -> List[StopLossOrder]:
         """获取所有止损订单"""
         conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT * FROM stop_loss_orders ORDER BY created_at DESC')
-        rows = cursor.fetchall()
-        conn.close()
-        
-        orders = []
-        for row in rows:
-            orders.append(StopLossOrder(
-                id=row['id'],
-                symbol=row['symbol'],
-                side=row['side'],
-                stop_price=row['stop_price'],
-                timeframe=row['timeframe'],
-                quantity=row['quantity'],
-                created_at=row['created_at'],
+        try:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM stop_loss_orders ORDER BY created_at DESC')
+            rows = cursor.fetchall()
+            return [StopLossOrder(
+                id=row['id'], symbol=row['symbol'], side=row['side'],
+                stop_price=row['stop_price'], timeframe=row['timeframe'],
+                quantity=row['quantity'], created_at=row['created_at'],
                 updated_at=row['updated_at']
-            ))
-        
-        return orders
+            ) for row in rows]
+        finally:
+            conn.close()
 
     def delete_stop_loss(self, order_id: int) -> bool:
         """删除止损订单"""
         conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('DELETE FROM stop_loss_orders WHERE id = ?', (order_id,))
-        deleted = cursor.rowcount > 0
-        
-        conn.commit()
-        conn.close()
-        
-        if deleted:
-            logger.info(f"删除止损订单: ID {order_id}")
-        return deleted
+        try:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM stop_loss_orders WHERE id = ?', (order_id,))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            if deleted:
+                logger.info(f"删除止损订单: ID {order_id}")
+            return deleted
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"删除止损订单失败: {e}")
+            raise
+        finally:
+            conn.close()
 
     def delete_stop_losses_by_symbol(self, symbol: str) -> int:
         """删除指定交易对的所有止损订单"""
         conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('DELETE FROM stop_loss_orders WHERE symbol = ?', (symbol,))
-        count = cursor.rowcount
-        
-        conn.commit()
-        conn.close()
-        
-        if count > 0:
-            logger.info(f"删除 {symbol} 的 {count} 个止损订单")
-        return count
+        try:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM stop_loss_orders WHERE symbol = ?', (symbol,))
+            count = cursor.rowcount
+            conn.commit()
+            if count > 0:
+                logger.info(f"删除 {symbol} 的 {count} 个止损订单")
+            return count
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"删除止损订单失败: {e}")
+            raise
+        finally:
+            conn.close()
 
     def update_stop_loss(self, order_id: int, stop_price: Optional[float] = None,
                         timeframe: Optional[str] = None, quantity: Optional[float] = None) -> bool:
         """更新止损订单"""
         conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        updates = []
-        params = []
-        
-        if stop_price is not None:
-            updates.append('stop_price = ?')
-            params.append(stop_price)
-        
-        if timeframe is not None:
-            updates.append('timeframe = ?')
-            params.append(timeframe)
-        
-        if quantity is not None:
-            updates.append('quantity = ?')
-            params.append(quantity)
-        
-        if not updates:
+        try:
+            cursor = conn.cursor()
+            updates = []
+            params = []
+
+            if stop_price is not None:
+                updates.append('stop_price = ?')
+                params.append(stop_price)
+            if timeframe is not None:
+                updates.append('timeframe = ?')
+                params.append(timeframe)
+            if quantity is not None:
+                updates.append('quantity = ?')
+                params.append(quantity)
+            if not updates:
+                return False
+
+            updates.append('updated_at = CURRENT_TIMESTAMP')
+            params.append(order_id)
+
+            query = f"UPDATE stop_loss_orders SET {', '.join(updates)} WHERE id = ?"
+            cursor.execute(query, params)
+            updated = cursor.rowcount > 0
+            conn.commit()
+            if updated:
+                logger.info(f"更新止损订单: ID {order_id}")
+            return updated
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"更新止损订单失败: {e}")
+            raise
+        finally:
             conn.close()
-            return False
-        
-        updates.append('updated_at = CURRENT_TIMESTAMP')
-        params.append(order_id)
-        
-        query = f"UPDATE stop_loss_orders SET {', '.join(updates)} WHERE id = ?"
-        cursor.execute(query, params)
-        
-        updated = cursor.rowcount > 0
-        conn.commit()
-        conn.close()
-        
-        if updated:
-            logger.info(f"更新止损订单: ID {order_id}")
-        return updated
 
