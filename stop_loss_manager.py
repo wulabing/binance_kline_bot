@@ -44,6 +44,16 @@ class StopLossManager:
         # key: timeframe, value: bool
         self.evaluation_sending_tasks = {}
 
+        # 后台任务注册表（用于优雅停机）
+        self._background_tasks = set()
+
+    def _track_task(self, coro):
+        """创建并跟踪后台任务"""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     async def start(self):
         """启动止损管理器"""
         logger.info("启动止损管理器")
@@ -59,16 +69,38 @@ class StopLossManager:
             logger.warning(f"初始化止损管理器持仓缓存失败: {e}")
             self.current_positions = {}
         
-        # 启动持仓检查任务
-        asyncio.create_task(self._check_positions_loop())
-        
-        # 启动止损监控任务
-        asyncio.create_task(self._monitor_stop_losses())
+        # 启动持仓检查任务（纳入生命周期管理）
+        self._track_task(self._check_positions_loop())
+
+        # 启动止损监控任务（纳入生命周期管理）
+        self._track_task(self._monitor_stop_losses())
     
     async def stop(self):
         """停止止损管理器"""
         logger.info("停止止损管理器")
         self.running = False
+
+        # 取消所有被追踪的后台任务
+        if self._background_tasks:
+            logger.info(f"正在取消 {len(self._background_tasks)} 个止损监控任务...")
+            for task in list(self._background_tasks):
+                task.cancel()
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            self._background_tasks.clear()
+
+        # 取消所有按交易对分组的监控任务
+        if self.monitoring_tasks:
+            logger.info(f"正在取消 {len(self.monitoring_tasks)} 个符号监控任务...")
+            for key, task in list(self.monitoring_tasks.items()):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *[t for t in self.monitoring_tasks.values() if not t.done()],
+                return_exceptions=True
+            )
+            self.monitoring_tasks.clear()
+
+        logger.info("止损管理器已完全停止")
 
     async def _check_positions_loop(self):
         """定期检查持仓，清理已平仓交易对的止损订单"""
@@ -162,20 +194,23 @@ class StopLossManager:
                 # 获取所有止损订单
                 all_stop_losses = self.database.get_all_stop_losses()
                 
-                # 按交易对和时间周期分组
+                # 按交易对、时间周期和方向分组（支持双向持仓）
                 monitoring_groups = {}
                 for order in all_stop_losses:
-                    key = f"{order.symbol}_{order.timeframe}"
+                    key = f"{order.symbol}_{order.timeframe}_{order.side}"
                     if key not in monitoring_groups:
                         monitoring_groups[key] = []
                     monitoring_groups[key].append(order)
-                
+
                 # 为每个组创建监控任务
                 for key, orders in monitoring_groups.items():
                     if key not in self.monitoring_tasks or self.monitoring_tasks[key].done():
                         symbol = orders[0].symbol
                         timeframe = orders[0].timeframe
-                        task = asyncio.create_task(self._monitor_symbol_timeframe(symbol, timeframe))
+                        side = orders[0].side
+                        task = asyncio.create_task(
+                            self._monitor_symbol_timeframe(symbol, timeframe, side)
+                        )
                         self.monitoring_tasks[key] = task
                 
             except asyncio.CancelledError:
@@ -183,9 +218,9 @@ class StopLossManager:
             except Exception as e:
                 logger.error(f"监控止损订单时出错: {e}")
 
-    async def _monitor_symbol_timeframe(self, symbol: str, timeframe: str):
-        """监控特定交易对和时间周期的止损"""
-        logger.info(f"开始监控 {symbol} [{timeframe}] 的止损")
+    async def _monitor_symbol_timeframe(self, symbol: str, timeframe: str, side: str):
+        """监控特定交易对、时间周期和方向的止损"""
+        logger.info(f"开始监控 {symbol} {side} [{timeframe}] 的止损")
         
         # 转换时间周期为秒数
         interval_seconds = self._timeframe_to_seconds(timeframe)
@@ -195,19 +230,20 @@ class StopLossManager:
         
         while self.running:
             try:
-                # 获取该交易对和时间周期的所有止损订单
+                # 获取该交易对、时间周期和方向的所有止损订单
                 all_orders = self.database.get_all_stop_losses()
-                orders = [o for o in all_orders if o.symbol == symbol and o.timeframe == timeframe]
-                
+                orders = [o for o in all_orders
+                          if o.symbol == symbol and o.timeframe == timeframe and o.side == side]
+
                 if not orders:
                     # 没有订单了，退出监控
-                    logger.info(f"停止监控 {symbol} [{timeframe}]，无止损订单")
+                    logger.info(f"停止监控 {symbol} {side} [{timeframe}]，无止损订单")
                     break
-                
+
                 # 检查是否有持仓（使用 symbol_side 组合检查）
-                position_key = f"{symbol}_{orders[0].side}"
+                position_key = f"{symbol}_{side}"
                 if position_key not in self.current_positions:
-                    logger.info(f"停止监控 {symbol} [{timeframe}] {orders[0].side}，无持仓")
+                    logger.info(f"停止监控 {symbol} {side} [{timeframe}]，无持仓")
                     break
                 
                 try:
@@ -222,7 +258,7 @@ class StopLossManager:
                         await asyncio.sleep(5)
                         continue
                     
-                    current_time = int(datetime.now().timestamp() * 1000)
+                    current_time = await self.binance_client.get_server_time()
                     last_processed_close = self.last_kline_close_time.get(f"{symbol}_{timeframe}", 0)
                     
                     # 找出最近一根已经收盘且未处理过的K线
@@ -263,11 +299,11 @@ class StopLossManager:
                     
                 except Exception as e:
                     consecutive_errors += 1
-                    logger.error(f"监控 {symbol} [{timeframe}] 时出错 ({consecutive_errors}/{max_consecutive_errors}): {e}")
-                    
+                    logger.error(f"监控 {symbol} {side} [{timeframe}] 时出错 ({consecutive_errors}/{max_consecutive_errors}): {e}")
+
                     # 如果连续错误次数过多，等待更长时间
                     if consecutive_errors >= max_consecutive_errors:
-                        logger.warning(f"{symbol} [{timeframe}] 监控连续失败 {consecutive_errors} 次，等待30秒后继续...")
+                        logger.warning(f"{symbol} {side} [{timeframe}] 监控连续失败 {consecutive_errors} 次，等待30秒后继续...")
                         await asyncio.sleep(30)
                         consecutive_errors = 0
                     else:
@@ -278,7 +314,7 @@ class StopLossManager:
             except Exception as e:
                 if not self.running:
                     break
-                logger.error(f"监控 {symbol} [{timeframe}] 循环异常: {e}")
+                logger.error(f"监控 {symbol} {side} [{timeframe}] 循环异常: {e}")
                 await asyncio.sleep(5)
 
     async def _check_stop_loss_trigger(self, order: StopLossOrder, current_price: float):
@@ -312,35 +348,48 @@ class StopLossManager:
             await self._execute_stop_loss(order, position, current_price)
 
     async def _execute_stop_loss(self, order: StopLossOrder, position: Dict, trigger_price: float):
-        """执行止损"""
+        """执行止损（确认成交后才删除订单）"""
         try:
             # 确定平仓方向（多头平仓=卖出，空头平仓=买入）
             side = 'SELL' if order.side == 'LONG' else 'BUY'
-            
-            # 确定持仓方向参数（用于双向持仓模式）
             position_side = order.side  # LONG 或 SHORT
-            
-            # 确定平仓数量
             quantity = order.quantity if order.quantity else position['position_amt']
-            
+
             logger.info(
                 f"执行止损: {order.symbol} {side} {quantity} "
                 f"(持仓方向: {position_side}, 触发价: {trigger_price}, 止损价: {order.stop_price})"
             )
-            
-            # 下市价单，指定持仓方向
+
+            # 下市价单
             result = await self.binance_client.place_market_order(
                 symbol=order.symbol,
                 side=side,
                 quantity=quantity,
-                position_side=position_side  # 指定持仓方向
+                position_side=position_side
             )
-            
-            logger.info(f"止损订单已执行: {result}")
-            
-            # 删除已执行的止损订单
-            self.database.delete_stop_loss(order.id)
-            
+
+            logger.info(f"止损订单已提交: {result}")
+
+            # 确认订单状态：只有 FILLED 才删除止损记录
+            order_status = result.get('status', '')
+            if order_status == 'FILLED':
+                self.database.delete_stop_loss(order.id)
+                logger.info(f"止损订单 {order.id} 已成交，已从数据库删除")
+            elif order_status in ('NEW', 'PARTIALLY_FILLED'):
+                # 市价单通常立即成交，但极端情况下可能部分成交
+                # 仍然删除止损记录，避免重复触发
+                self.database.delete_stop_loss(order.id)
+                logger.warning(
+                    f"止损订单 {order.id} 状态为 {order_status}，"
+                    f"已删除止损记录以避免重复触发"
+                )
+            else:
+                # 异常状态（REJECTED/EXPIRED/CANCELED），保留止损记录
+                logger.error(
+                    f"止损订单 {order.id} 执行异常，状态: {order_status}，"
+                    f"保留止损记录以便下次重试"
+                )
+
             # 触发回调
             if self.on_stop_loss_triggered:
                 await self.on_stop_loss_triggered({
@@ -349,10 +398,10 @@ class StopLossManager:
                     'trigger_price': trigger_price,
                     'result': result
                 })
-            
+
         except Exception as e:
-            logger.error(f"执行止损失败: {e}")
-            
+            logger.error(f"执行止损失败: {e}，保留止损记录以便下次重试")
+
             if self.on_stop_loss_triggered:
                 await self.on_stop_loss_triggered({
                     'action': 'failed',
@@ -427,7 +476,7 @@ class StopLossManager:
             if timeframe not in self.evaluation_sending_tasks or not self.evaluation_sending_tasks[timeframe]:
                 self.evaluation_sending_tasks[timeframe] = True
                 logger.info(f"启动 {timeframe} 周期的评估信息发送任务")
-                asyncio.create_task(self._send_evaluation_after_delay(timeframe))
+                self._track_task(self._send_evaluation_after_delay(timeframe))
             else:
                 logger.info(f"{timeframe} 周期的评估信息发送任务已在运行中，等待合并发送")
             
@@ -437,21 +486,15 @@ class StopLossManager:
     async def _send_evaluation_after_delay(self, timeframe: str):
         """延迟发送评估信息，以便收集同一周期的多个币种"""
         try:
-            # 等待8秒，让同一周期的所有币种都有机会收集评估信息
-            # 增加延迟以避免整点时多个币种评估信息丢失
             await asyncio.sleep(8)
-            
-            # 检查是否还有待发送的评估信息
+
             if timeframe not in self.pending_evaluations or not self.pending_evaluations[timeframe]:
-                self.evaluation_sending_tasks[timeframe] = False
                 return
-            
-            # 获取该周期的所有评估信息（先复制再清空，避免竞争条件）
+
+            # 取出并清空（原子操作，避免竞态）
             evaluations = self.pending_evaluations[timeframe].copy()
-            # 清空待发送列表
             self.pending_evaluations[timeframe] = []
-            
-            # 发送评估信息
+
             if self.on_evaluation_notification and evaluations:
                 logger.info(f"发送 {timeframe} 周期的评估信息，包含 {len(evaluations)} 条评估")
                 await self.on_evaluation_notification({
@@ -461,8 +504,17 @@ class StopLossManager:
         except Exception as e:
             logger.error(f"发送评估信息时出错: {e}")
         finally:
-            # 重置发送任务标志
-            self.evaluation_sending_tasks[timeframe] = False
+            # 重置标志前检查是否有残留（发送期间新进入的评估）
+            has_remaining = (
+                timeframe in self.pending_evaluations
+                and len(self.pending_evaluations[timeframe]) > 0
+            )
+            if has_remaining:
+                # 有残留，立即启动下一轮发送
+                logger.info(f"{timeframe} 发送期间有新评估进入，启动下一轮发送")
+                self._track_task(self._send_evaluation_after_delay(timeframe))
+            else:
+                self.evaluation_sending_tasks[timeframe] = False
 
     async def add_stop_loss_order(self, symbol: str, side: str, stop_price: float,
                                   timeframe: str, quantity: Optional[float] = None) -> int:
