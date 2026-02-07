@@ -47,12 +47,22 @@ class BinanceClient:
         # WebSocket 连接状态
         self.ws_connected = False
         self.last_ws_message_time = 0
-        
+
+        # 后台任务注册表（用于优雅停机）
+        self._background_tasks = set()
+
         # 回调函数
         self.on_position_update = None
         self.on_position_closed = None  # 平仓回调
         self.on_order_update = None
         self.on_account_update = None
+
+    def _track_task(self, coro):
+        """创建并跟踪后台任务"""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def _generate_signature(self, params: Dict) -> str:
         """生成签名"""
@@ -68,38 +78,66 @@ class BinanceClient:
         """发送 HTTP 请求，带重试机制"""
         url = f"{self.base_url}{endpoint}"
         headers = {"X-MBX-APIKEY": self.api_key}
-        
+
+        # 保存原始参数的副本，避免重试时签名污染
+        original_params = kwargs.get('params', {}).copy()
+
         for attempt in range(retry_count):
             try:
                 if signed:
-                    params = kwargs.get('params', {})
+                    # 每次重试都基于原始参数重新构造，避免旧 signature 被签入
+                    params = original_params.copy()
+                    params.pop('signature', None)
+                    params.pop('timestamp', None)
                     params['timestamp'] = int(time.time() * 1000)
                     params['signature'] = self._generate_signature(params)
                     kwargs['params'] = params
-                
+
                 if self.session is None:
                     # 创建带有超时和连接池配置的 session
                     timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
                     connector = aiohttp.TCPConnector(limit=100, limit_per_host=30, ttl_dns_cache=300)
                     self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-                
+
                 async with self.session.request(method, url, headers=headers, **kwargs) as response:
                     data = await response.json()
-                    if response.status != 200:
-                        logger.error(f"API 请求失败: {data}")
-                        raise Exception(f"API Error: {data}")
-                    return data
-                    
+
+                    if response.status == 200:
+                        return data
+
+                    # 可重试的 HTTP 状态码（429限频、5xx服务端错误）
+                    if response.status in (429, 500, 502, 503, 504) and attempt < retry_count - 1:
+                        retry_after = int(response.headers.get('Retry-After', 2 ** attempt))
+                        logger.warning(f"API 返回 {response.status}，{retry_after}秒后重试...")
+                        await asyncio.sleep(retry_after)
+                        continue
+
+                    # 不可重试的错误，直接抛出
+                    logger.error(f"API 请求失败 [{response.status}]: {data}")
+                    raise Exception(f"API Error [{response.status}]: {data}")
+
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
                 logger.warning(f"API 请求失败 (尝试 {attempt + 1}/{retry_count}): {e}")
                 if attempt < retry_count - 1:
                     # 指数退避：2秒、4秒、8秒
-                    wait_time = 2 ** attempt
+                    wait_time = 2 ** (attempt + 1)
                     logger.info(f"等待 {wait_time} 秒后重试...")
                     await asyncio.sleep(wait_time)
                 else:
                     logger.error(f"API 请求最终失败，endpoint: {endpoint}")
                     raise
+
+    async def get_server_time(self) -> int:
+        """获取币安服务器时间（毫秒时间戳）
+
+        用于校准本地时钟，避免K线收盘判断偏差
+        """
+        try:
+            data = await self._request('GET', '/fapi/v1/time', retry_count=2)
+            return data['serverTime']
+        except Exception as e:
+            logger.warning(f"获取服务器时间失败，回退到本地时间: {e}")
+            return int(time.time() * 1000)
 
     async def get_listen_key(self) -> str:
         """获取 User Data Stream 的 listen key"""
@@ -251,8 +289,8 @@ class BinanceClient:
         """启动用户数据流 WebSocket"""
         self.running = True
         
-        # 启动 keep-alive 任务
-        asyncio.create_task(self.keep_alive_listen_key())
+        # 启动 keep-alive 任务（纳入生命周期管理）
+        self._track_task(self.keep_alive_listen_key())
         
         reconnect_delay = 5  # 初始重连延迟
         max_reconnect_delay = 60  # 最大重连延迟
@@ -279,8 +317,8 @@ class BinanceClient:
                     # 连接成功，重置重连延迟
                     reconnect_delay = 5
                     
-                    # WebSocket 重连后，检查是否有新订单（防止重连期间错过订单）
-                    asyncio.create_task(self._check_missed_orders())
+                    # WebSocket 重连后，全量对账（持仓 + 订单）
+                    self._track_task(self._reconcile_after_reconnect())
                     
                     async for message in ws:
                         if not self.running:
@@ -315,6 +353,61 @@ class BinanceClient:
                 self.listen_key = None
         
         logger.info("WebSocket 用户数据流已停止")
+
+    async def _reconcile_after_reconnect(self):
+        """WebSocket 重连后全量对账（持仓 + 订单）"""
+        try:
+            await asyncio.sleep(2)
+            if not self.ws_connected:
+                return
+
+            logger.info("开始 WebSocket 重连后全量对账...")
+
+            # 1. 持仓对账
+            await self._reconcile_positions()
+
+            # 2. 订单对账
+            await self._check_missed_orders()
+
+            logger.info("WebSocket 重连后全量对账完成")
+        except Exception as e:
+            logger.error(f"重连后全量对账失败: {e}", exc_info=True)
+
+    async def _reconcile_positions(self):
+        """持仓全量对账：REST 快照与缓存比对"""
+        try:
+            positions = await self.get_positions()
+            current_snapshot = {}
+            for pos in positions:
+                key = f"{pos['symbol']}_{pos['side']}"
+                amt = pos['position_amt'] if pos['side'] == 'LONG' else -pos['position_amt']
+                current_snapshot[key] = amt
+
+            # 检测缓存中有但实际已平仓的持仓
+            for key, old_amt in list(self.position_cache.items()):
+                if key not in current_snapshot and old_amt != 0:
+                    symbol = key.rsplit('_', 1)[0]
+                    side = key.rsplit('_', 1)[1]
+                    logger.warning(f"对账发现已平仓: {key} (缓存={old_amt})")
+                    del self.position_cache[key]
+                    if self.on_position_closed:
+                        await self.on_position_closed({
+                            'symbol': symbol,
+                            'previous_side': side,
+                            'previous_amount': abs(old_amt)
+                        })
+
+            # 检测实际有但缓存中没有的新持仓
+            for key, new_amt in current_snapshot.items():
+                if key not in self.position_cache:
+                    logger.warning(f"对账发现新持仓: {key} (数量={new_amt})")
+
+            # 更新缓存为最新快照
+            self.position_cache = current_snapshot
+            logger.info(f"持仓对账完成，当前持仓数: {len(current_snapshot)}")
+
+        except Exception as e:
+            logger.error(f"持仓对账失败: {e}", exc_info=True)
 
     async def _check_missed_orders(self):
         """检查 WebSocket 重连期间是否错过了新订单
@@ -420,7 +513,22 @@ class BinanceClient:
                     
                     # 如果是单向持仓模式（BOTH），根据数量判断方向
                     if position_side == 'BOTH':
-                        position_side = 'LONG' if position_amt > 0 else 'SHORT'
+                        if position_amt > 0:
+                            position_side = 'LONG'
+                        elif position_amt < 0:
+                            position_side = 'SHORT'
+                        else:
+                            # pa=0 表示平仓，从缓存中推断原方向
+                            cached_long = f"{symbol}_LONG"
+                            cached_short = f"{symbol}_SHORT"
+                            if cached_long in self.position_cache:
+                                position_side = 'LONG'
+                            elif cached_short in self.position_cache:
+                                position_side = 'SHORT'
+                            else:
+                                # 缓存中也没有，跳过此条
+                                logger.debug(f"单向模式 {symbol} pa=0 且缓存无记录，跳过")
+                                continue
                     
                     position_key = f"{symbol}_{position_side}"
                     current_positions[position_key] = {
@@ -523,20 +631,25 @@ class BinanceClient:
     async def close(self):
         """关闭连接"""
         self.running = False
-        
+
+        # 取消所有被追踪的后台任务
+        if self._background_tasks:
+            logger.info(f"正在取消 {len(self._background_tasks)} 个后台任务...")
+            for task in list(self._background_tasks):
+                task.cancel()
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            self._background_tasks.clear()
+
         if self.ws_connection:
             try:
                 await self.ws_connection.close()
             except Exception as e:
                 logger.warning(f"关闭 WebSocket 连接时出错: {e}")
-        
+
         if self.session:
             try:
                 await self.session.close()
             except Exception as e:
                 logger.warning(f"关闭 HTTP 会话时出错: {e}")
-        
-        # 等待一小段时间，让后台任务有机会退出
-        await asyncio.sleep(0.5)
-        
+
         logger.info("币安客户端已关闭")
