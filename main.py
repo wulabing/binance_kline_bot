@@ -57,6 +57,11 @@ class TradingBot:
             if section not in config:
                 logger.error(f"配置文件缺少 [{section}] 部分")
                 sys.exit(1)
+
+        # [trading] 段为可选，缺失时使用默认值
+        if 'trading' not in config:
+            config['trading'] = {}
+            logger.info("[trading] 配置段缺失，使用默认值")
         
         self.config = config
         logger.info("配置文件加载成功")

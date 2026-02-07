@@ -12,3 +12,5 @@ venv/
 nohup.out
 .binance-telegram-venv/
 test*.py
+.ace-tool/
+.serena/
