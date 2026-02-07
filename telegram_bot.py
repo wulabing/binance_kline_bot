@@ -3,6 +3,7 @@ Telegram Bot 模块
 提供用户交互界面，设置和管理止损订单
 """
 import asyncio
+import functools
 import logging
 import time
 from typing import Dict, List, Optional
@@ -38,14 +39,50 @@ class TelegramBot:
         self.stop_loss_manager = stop_loss_manager
         self.application = None
         
-        # 临时存储用户输入
+        # 授权的 chat_id 列表（支持多个）
+        self.allowed_chat_ids = {str(chat_id)}
+
+        # 临时存储用户输入（带 TTL 自动清理）
+        # 格式: {user_id: {'_created_at': timestamp, ...其他数据}}
         self.user_data_cache = {}
-        
+        self.user_data_cache_ttl = 600  # 10分钟过期
+        self.cache_cleanup_task = None
+
         # 消息发送失败计数器和健康检查
         self.failed_send_count = 0
         self.last_successful_send = time.time()
         self.health_check_interval = 300  # 5分钟检查一次
         self.health_check_task = None
+
+    def _is_authorized(self, update: Update) -> bool:
+        """检查用户是否有权限操作 Bot"""
+        chat_id = str(update.effective_chat.id) if update.effective_chat else None
+        return chat_id in self.allowed_chat_ids
+
+    async def _unauthorized_handler(self, update: Update):
+        """处理未授权的访问"""
+        user = update.effective_user
+        chat_id = update.effective_chat.id if update.effective_chat else 'unknown'
+        logger.warning(f"未授权访问: user_id={user.id if user else 'unknown'}, chat_id={chat_id}")
+
+    async def _cache_cleanup_loop(self):
+        """定期清理过期的 user_data_cache 条目"""
+        while True:
+            try:
+                await asyncio.sleep(60)  # 每60秒检查一次
+                now = time.time()
+                expired_keys = [
+                    uid for uid, data in self.user_data_cache.items()
+                    if now - data.get('_created_at', 0) > self.user_data_cache_ttl
+                ]
+                for uid in expired_keys:
+                    del self.user_data_cache[uid]
+                if expired_keys:
+                    logger.info(f"清理了 {len(expired_keys)} 个过期的会话缓存")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"缓存清理任务出错: {e}")
 
     async def start(self):
         """启动 Telegram Bot"""
@@ -134,8 +171,11 @@ class TelegramBot:
         
         # 启动健康检查任务
         self.health_check_task = asyncio.create_task(self._health_check_loop())
-        
-        logger.info("Telegram Bot 已启动（含健康检查）")
+
+        # 启动缓存清理任务
+        self.cache_cleanup_task = asyncio.create_task(self._cache_cleanup_loop())
+
+        logger.info("Telegram Bot 已启动（含健康检查和缓存清理）")
 
     async def set_bot_commands(self):
         """设置 Bot 命令菜单"""
@@ -159,34 +199,25 @@ class TelegramBot:
 
     async def _reinitialize_connection(self):
         """重新初始化 Telegram Bot 连接
-        
-        当发送消息多次失败时调用此方法重新建立连接
+
+        当发送消息多次失败时调用此方法重新建立连接。
+        使用公共 API 而非操作私有属性，确保版本兼容性。
         """
         try:
             logger.info("正在重新初始化 Telegram Bot 连接...")
-            
-            # 不关闭整个 application，只重新创建 bot 的 HTTP 客户端
-            if self.application and self.application.bot:
-                # 关闭旧的 HTTP 客户端
+
+            if self.application:
+                # 使用公共 API 重启：先停止再重新初始化
                 try:
-                    if hasattr(self.application.bot, '_request') and self.application.bot._request:
-                        await self.application.bot._request.shutdown()
+                    await self.application.bot.close()
                 except Exception as e:
-                    logger.warning(f"关闭旧连接时出错: {e}")
-                
-                # 重新创建请求对象
-                from telegram.request import HTTPXRequest
-                new_request = HTTPXRequest(
-                    connection_pool_size=8,
-                    connect_timeout=30.0,
-                    read_timeout=30.0,
-                    write_timeout=30.0,
-                    pool_timeout=30.0
-                )
-                
-                # 更新 bot 的请求对象
-                self.application.bot._request = new_request
-                
+                    logger.warning(f"关闭旧 Bot 连接时出错: {e}")
+
+                try:
+                    await self.application.bot.initialize()
+                except Exception as e:
+                    logger.warning(f"重新初始化 Bot 时出错: {e}")
+
                 logger.info("Telegram Bot 连接重新初始化成功")
                 
         except Exception as e:
@@ -244,7 +275,15 @@ class TelegramBot:
                 await self.health_check_task
             except asyncio.CancelledError:
                 pass
-        
+
+        # 取消缓存清理任务
+        if self.cache_cleanup_task:
+            self.cache_cleanup_task.cancel()
+            try:
+                await self.cache_cleanup_task
+            except asyncio.CancelledError:
+                pass
+
         if self.application:
             await self.application.updater.stop()
             await self.application.stop()
@@ -253,11 +292,39 @@ class TelegramBot:
 
     async def send_message(self, text: str, retry_count: int = 10):
         """发送消息到指定的 chat，带增强重试机制和自动恢复
-        
+
         Args:
             text: 要发送的消息文本
             retry_count: 重试次数（默认10次）
         """
+        # 自动分页：Telegram 消息限制 4096 字符
+        max_len = 4000
+        if len(text) > max_len:
+            chunks = self._split_message(text, max_len)
+            for i, chunk in enumerate(chunks):
+                await self._send_single_message(chunk, retry_count)
+                if i < len(chunks) - 1:
+                    await asyncio.sleep(0.3)
+            return
+
+        await self._send_single_message(text, retry_count)
+
+    @staticmethod
+    def _split_message(text: str, max_len: int) -> list:
+        """按换行符智能拆分长消息"""
+        chunks = []
+        while len(text) > max_len:
+            split_pos = text.rfind('\n', 0, max_len)
+            if split_pos == -1:
+                split_pos = max_len
+            chunks.append(text[:split_pos])
+            text = text[split_pos:].lstrip('\n')
+        if text:
+            chunks.append(text)
+        return chunks
+
+    async def _send_single_message(self, text: str, retry_count: int = 10):
+        """发送单条消息（带重试）"""
         for attempt in range(retry_count):
             try:
                 # 检查 application 是否存在
@@ -308,6 +375,9 @@ class TelegramBot:
     
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理 /start 命令"""
+        if not self._is_authorized(update):
+            await self._unauthorized_handler(update)
+            return
         welcome_text = (
             "🤖 欢迎使用币安止损管理 Bot！\n\n"
             "这个 Bot 可以帮助您管理基于 K 线确认的止损订单。\n\n"
@@ -317,6 +387,9 @@ class TelegramBot:
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理 /help 命令"""
+        if not self._is_authorized(update):
+            await self._unauthorized_handler(update)
+            return
         help_text = (
             "📚 可用命令列表：\n\n"
             "/start - 开始使用\n"
@@ -337,6 +410,9 @@ class TelegramBot:
 
     async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理 /positions 命令 - 查看当前持仓"""
+        if not self._is_authorized(update):
+            await self._unauthorized_handler(update)
+            return
         try:
             positions = await self.stop_loss_manager.binance_client.get_positions()
             
@@ -363,6 +439,9 @@ class TelegramBot:
 
     async def cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理 /orders 命令 - 查看币安委托订单"""
+        if not self._is_authorized(update):
+            await self._unauthorized_handler(update)
+            return
         try:
             orders = await self.stop_loss_manager.binance_client.get_open_orders()
             
@@ -404,6 +483,9 @@ class TelegramBot:
 
     async def cmd_stop_losses(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理 /stoplosses 命令 - 查看所有止损订单"""
+        if not self._is_authorized(update):
+            await self._unauthorized_handler(update)
+            return
         stop_losses = self.database.get_all_stop_losses()
         
         if not stop_losses:
@@ -426,6 +508,9 @@ class TelegramBot:
 
     async def cmd_add_stop_loss(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理 /addstoploss 命令 - 开始添加止损订单流程"""
+        if not self._is_authorized(update):
+            await self._unauthorized_handler(update)
+            return ConversationHandler.END
         try:
             logger.info(f"用户 {update.message.from_user.id} 执行 /addstoploss 命令")
             # 获取当前持仓
@@ -440,7 +525,7 @@ class TelegramBot:
             keyboard = []
             for pos in positions:
                 button_text = f"{pos['symbol']} ({pos['side']})"
-                keyboard.append([InlineKeyboardButton(button_text, callback_data=f"symbol_{pos['symbol']}_{pos['side']}")])
+                keyboard.append([InlineKeyboardButton(button_text, callback_data=f"symbol|{pos['symbol']}|{pos['side']}")])
             
             keyboard.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -470,20 +555,20 @@ class TelegramBot:
                 await query.edit_message_text("❌ 操作已取消")
                 return ConversationHandler.END
             
-            # 解析选择的交易对和方向
-            parts = query.data.split("_")
+            # 解析选择的交易对和方向（使用 | 分隔，避免 symbol 含下划线时解析错误）
+            parts = query.data.split("|")
             if len(parts) < 3:
                 logger.error(f"回调数据格式错误: {query.data}")
                 await query.edit_message_text("❌ 数据格式错误，请重新开始")
                 return ConversationHandler.END
-                
+
             symbol = parts[1]
             side = parts[2]
             logger.info(f"选择交易对: {symbol}, 方向: {side}")
             
             # 保存到用户数据
             user_id = query.from_user.id
-            self.user_data_cache[user_id] = {'symbol': symbol, 'side': side}
+            self.user_data_cache[user_id] = {'symbol': symbol, 'side': side, '_created_at': time.time()}
             
             # 显示时间周期选择
             keyboard = [
@@ -582,9 +667,33 @@ class TelegramBot:
             symbol = user_data['symbol']
             side = user_data['side']
             timeframe = user_data['timeframe']
-            
+
+            # 止损价格方向合理性校验
+            try:
+                klines = await self.stop_loss_manager.binance_client.get_kline_data(symbol, '1m', limit=1)
+                if klines:
+                    current_price = klines[0]['close']
+                    if side == 'LONG' and stop_price >= current_price:
+                        await update.message.reply_text(
+                            f"⚠️ 多头止损价应低于当前价格\n"
+                            f"当前价: {current_price}\n"
+                            f"您输入: {stop_price}\n\n"
+                            f"请重新输入止损价格："
+                        )
+                        return ENTERING_PRICE
+                    elif side == 'SHORT' and stop_price <= current_price:
+                        await update.message.reply_text(
+                            f"⚠️ 空头止损价应高于当前价格\n"
+                            f"当前价: {current_price}\n"
+                            f"您输入: {stop_price}\n\n"
+                            f"请重新输入止损价格："
+                        )
+                        return ENTERING_PRICE
+            except Exception as e:
+                logger.warning(f"获取当前价格校验失败（不阻塞创建）: {e}")
+
             logger.info(f"准备创建止损订单: {symbol} {side} @ {stop_price} [{timeframe}]")
-            
+
             # 添加止损订单
             order_id = await self.stop_loss_manager.add_stop_loss_order(
                 symbol=symbol,
@@ -620,6 +729,9 @@ class TelegramBot:
 
     async def cmd_delete_stop_loss(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理 /deletestoploss 命令 - 删除止损订单"""
+        if not self._is_authorized(update):
+            await self._unauthorized_handler(update)
+            return ConversationHandler.END
         stop_losses = self.database.get_all_stop_losses()
         
         if not stop_losses:
@@ -666,6 +778,9 @@ class TelegramBot:
 
     async def cmd_update_stop_loss(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理 /updatestoploss 命令 - 更新止损价格"""
+        if not self._is_authorized(update):
+            await self._unauthorized_handler(update)
+            return ConversationHandler.END
         stop_losses = self.database.get_all_stop_losses()
         
         if not stop_losses:
@@ -709,7 +824,7 @@ class TelegramBot:
         
         # 保存到用户数据
         user_id = query.from_user.id
-        self.user_data_cache[user_id] = {'order_id': order_id, 'order': order}
+        self.user_data_cache[user_id] = {'order_id': order_id, 'order': order, '_created_at': time.time()}
         
         # 显示修改选项
         keyboard = [
