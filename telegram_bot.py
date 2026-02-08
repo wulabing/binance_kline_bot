@@ -30,6 +30,18 @@ logger = logging.getLogger(__name__)
 
 class TelegramBot:
     """Telegram Bot 管理类"""
+
+    NOTIFICATION_SEPARATOR_LENGTH = 14
+    NOTIFICATION_TOP_SEPARATOR = '═' * NOTIFICATION_SEPARATOR_LENGTH
+    NOTIFICATION_BOTTOM_SEPARATOR = '─' * NOTIFICATION_SEPARATOR_LENGTH
+
+    def _build_notification_header(self, title: str) -> str:
+        """构建统一通知标题头"""
+        return (
+            f"{self.NOTIFICATION_TOP_SEPARATOR}\n"
+            f"{title}\n"
+            f"{self.NOTIFICATION_TOP_SEPARATOR}\n\n"
+        )
     
     def __init__(self, token: str, chat_id: str, database: Database, 
                  stop_loss_manager: StopLossManager):
@@ -1099,17 +1111,15 @@ class TelegramBot:
             pnl_text = f"{pnl:.2f}"
         
         text = (
-            f"{'═' * 25}\n"
-            f"📊 持仓更新通知\n"
-            f"{'═' * 25}\n\n"
-            f"🏷 交易对：{position['symbol']}\n"
+            self._build_notification_header("📊 持仓更新通知")
+            + f"🏷 交易对：{position['symbol']}\n"
             f"{side_icon} 方向：{side_text} ({position['side']})\n"
             f"📦 数量：{position['position_amt']}\n"
             f"💵 开仓价：{position['entry_price']}\n"
             f"⚖️ 杠杆：{position['leverage']}x\n"
             f"{pnl_icon} 未实现盈亏：{pnl_text} USDT\n"
             f"⚠️ 强平价：{position['liquidation_price']}\n"
-            f"{'─' * 25}"
+            + self.NOTIFICATION_BOTTOM_SEPARATOR
         )
         await self.send_message(text)
 
@@ -1120,14 +1130,12 @@ class TelegramBot:
         side_text = "做多" if data['previous_side'] == 'LONG' else "做空"
         
         text = (
-            f"{'═' * 25}\n"
-            f"🔒 持仓平仓通知\n"
-            f"{'═' * 25}\n\n"
-            f"🏷 交易对：{data['symbol']}\n"
+            self._build_notification_header("🔒 持仓平仓通知")
+            + f"🏷 交易对：{data['symbol']}\n"
             f"{side_icon} 方向：{side_text} ({data['previous_side']})\n"
             f"📦 数量：{data['previous_amount']}\n\n"
             f"✅ 该持仓已完全平仓\n"
-            f"{'─' * 25}"
+            + self.NOTIFICATION_BOTTOM_SEPARATOR
         )
         await self.send_message(text)
 
@@ -1175,10 +1183,8 @@ class TelegramBot:
         
         # 构建消息
         text = (
-            f"{'═' * 25}\n"
-            f"📋 订单更新通知\n"
-            f"{'═' * 25}\n\n"
-            f"🏷 交易对：{order['symbol']}\n"
+            self._build_notification_header("📋 订单更新通知")
+            + f"🏷 交易对：{order['symbol']}\n"
             f"🆔 订单ID：{order['order_id']}\n"
             f"{side_icon} 方向：{side_text}\n"
             f"{type_icon} 类型：{type_text}\n"
@@ -1205,7 +1211,7 @@ class TelegramBot:
         if order.get('reduce_only'):
             text += f"⚠️ 只减仓：是\n"
         
-        text += f"{'─' * 25}"
+        text += self.NOTIFICATION_BOTTOM_SEPARATOR
         
         await self.send_message(text)
 
@@ -1220,27 +1226,23 @@ class TelegramBot:
             side_text = "做多" if order['side'] == 'LONG' else "做空"
             
             text = (
-                f"{'═' * 25}\n"
-                f"🛡️ 止损已触发执行！\n"
-                f"{'═' * 25}\n\n"
-                f"🏷 交易对：{order['symbol']}\n"
+                self._build_notification_header("🛡️ 止损已触发执行！")
+                + f"🏷 交易对：{order['symbol']}\n"
                 f"{side_icon} 方向：{side_text} ({order['side']})\n"
                 f"📊 触发价：{data['trigger_price']}\n"
                 f"🎯 止损价：{order['stop_price']}\n"
                 f"⏰ K线周期：{order['timeframe']}\n\n"
                 f"✅ 市价单已提交，等待成交\n"
-                f"{'─' * 25}"
+                + self.NOTIFICATION_BOTTOM_SEPARATOR
             )
         elif action == 'failed':
             order = data['order']
             text = (
-                f"{'═' * 25}\n"
-                f"❌ 止损执行失败！\n"
-                f"{'═' * 25}\n\n"
-                f"🏷 交易对：{order['symbol']}\n"
+                self._build_notification_header("❌ 止损执行失败！")
+                + f"🏷 交易对：{order['symbol']}\n"
                 f"⚠️ 错误信息：{data['error']}\n\n"
                 f"🔔 请手动检查持仓状态\n"
-                f"{'─' * 25}"
+                + self.NOTIFICATION_BOTTOM_SEPARATOR
             )
         elif action == 'cleaned':
             deleted_count = data.get('deleted_count', 0)
@@ -1249,14 +1251,12 @@ class TelegramBot:
             side_text = "做多" if side == 'LONG' else "做空"
             
             text = (
-                f"{'═' * 25}\n"
-                f"🧹 自动清理通知\n"
-                f"{'═' * 25}\n\n"
-                f"🏷 交易对：{data['symbol']}\n"
+                self._build_notification_header("🧹 自动清理通知")
+                + f"🏷 交易对：{data['symbol']}\n"
                 f"{side_icon} 方向：{side_text} ({side})\n"
                 f"📝 原因：{data['reason']}\n"
                 f"🗑️ 已删除止损订单：{deleted_count} 个\n"
-                f"{'─' * 25}"
+                + self.NOTIFICATION_BOTTOM_SEPARATOR
             )
         else:
             text = f"⚠️ 未知操作: {action}"
@@ -1311,4 +1311,3 @@ class TelegramBot:
             text += "\n"
         
         await self.send_message(text)
-
