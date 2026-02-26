@@ -165,10 +165,46 @@ class BinanceClient:
                         logger.error(f"更新 Listen Key 失败: {e}")
                         # 清空 listen_key，让 WebSocket 重连时重新获取
                         self.listen_key = None
+                        # 主动关闭 WebSocket，避免僵尸连接
+                        if self.ws_connection:
+                            logger.warning("listenKey 续期失败，主动关闭 WebSocket 触发重连")
+                            try:
+                                await self.ws_connection.close()
+                            except Exception:
+                                pass
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Keep alive 任务错误: {e}")
+
+    async def _ws_health_check(self):
+        """WebSocket 健康检查：检测僵尸连接并强制重连"""
+        check_interval = 300  # 每 5 分钟检查一次
+        stale_threshold = 600  # 10 分钟无消息视为僵尸连接
+        while self.running:
+            try:
+                await asyncio.sleep(check_interval)
+                if not self.running or not self.ws_connected:
+                    continue
+                if self.last_ws_message_time <= 0:
+                    continue
+
+                elapsed = time.time() - self.last_ws_message_time
+                if elapsed > stale_threshold:
+                    logger.warning(
+                        f"WebSocket 已 {elapsed:.0f}s 未收到消息，"
+                        f"疑似僵尸连接，强制重连..."
+                    )
+                    self.listen_key = None
+                    if self.ws_connection:
+                        try:
+                            await self.ws_connection.close()
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"WebSocket 健康检查错误: {e}")
 
     async def get_positions(self) -> List[Dict]:
         """获取当前所有持仓
@@ -291,7 +327,9 @@ class BinanceClient:
         
         # 启动 keep-alive 任务（纳入生命周期管理）
         self._track_task(self.keep_alive_listen_key())
-        
+        # 启动 WebSocket 健康检查任务
+        self._track_task(self._ws_health_check())
+
         reconnect_delay = 5  # 初始重连延迟
         max_reconnect_delay = 60  # 最大重连延迟
         
@@ -478,7 +516,15 @@ class BinanceClient:
     async def _handle_user_data(self, data: Dict):
         """处理用户数据流消息"""
         event_type = data.get('e')
-        
+
+        if event_type == 'listenKeyExpired':
+            logger.warning("收到 listenKeyExpired 事件，listenKey 已过期，强制重连...")
+            self.listen_key = None
+            # 主动关闭 WebSocket，触发重连循环
+            if self.ws_connection:
+                await self.ws_connection.close()
+            return
+
         if event_type == 'ACCOUNT_UPDATE':
             # 账户更新事件
             logger.info(f"账户更新事件: {data}")
