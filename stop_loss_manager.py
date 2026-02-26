@@ -69,12 +69,45 @@ class StopLossManager:
             logger.warning(f"初始化止损管理器持仓缓存失败: {e}")
             self.current_positions = {}
         
+        # 为已有止损订单初始化K线基准时间（避免重启后立刻评估历史已收盘K线）
+        await self._init_kline_baselines()
+
         # 启动持仓检查任务（纳入生命周期管理）
         self._track_task(self._check_positions_loop())
 
         # 启动止损监控任务（纳入生命周期管理）
         self._track_task(self._monitor_stop_losses())
     
+    async def _init_kline_baselines(self):
+        """为已有止损订单初始化K线基准时间，避免重启后立刻评估历史已收盘K线"""
+        all_stop_losses = self.database.get_all_stop_losses()
+        if not all_stop_losses:
+            return
+
+        # 按 (symbol, timeframe) 去重
+        kline_keys = set()
+        for order in all_stop_losses:
+            kline_keys.add((order.symbol, order.timeframe))
+
+        initialized = 0
+        for symbol, timeframe in kline_keys:
+            key = f"{symbol}_{timeframe}"
+            if key in self.last_kline_close_time:
+                continue
+            try:
+                klines = await self.binance_client.get_kline_data(symbol, timeframe, limit=2)
+                current_time = await self.binance_client.get_server_time()
+                if klines:
+                    for kline in klines:
+                        if current_time >= kline['close_time']:
+                            self.last_kline_close_time[key] = kline['close_time']
+                    initialized += 1
+            except Exception as e:
+                logger.warning(f"初始化 {key} K线基准时间失败: {e}")
+
+        if initialized > 0:
+            logger.info(f"已初始化 {initialized} 个交易对的K线基准时间，重启后仅评估新收盘K线")
+
     async def stop(self):
         """停止止损管理器"""
         logger.info("停止止损管理器")
