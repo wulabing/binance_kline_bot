@@ -15,3 +15,7 @@ test*.py
 .ace-tool/
 .serena/
 .zcf/
+.claude/
+.codex/
+.gemini/
+.qwen/
