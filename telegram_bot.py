@@ -127,7 +127,10 @@ class TelegramBot:
         
         # 添加止损订单会话处理器
         add_stop_loss_conv = ConversationHandler(
-            entry_points=[CommandHandler("addstoploss", self.cmd_add_stop_loss)],
+            entry_points=[
+                CommandHandler("addstoploss", self.cmd_add_stop_loss),
+                CallbackQueryHandler(self.cmd_add_stop_loss, pattern="^help_addstoploss$"),
+            ],
             states={
                 SELECTING_SYMBOL: [CallbackQueryHandler(self.select_symbol)],
                 SELECTING_TIMEFRAME: [CallbackQueryHandler(self.select_timeframe)],
@@ -142,7 +145,10 @@ class TelegramBot:
         
         # 删除止损订单会话处理器
         delete_stop_loss_conv = ConversationHandler(
-            entry_points=[CommandHandler("deletestoploss", self.cmd_delete_stop_loss)],
+            entry_points=[
+                CommandHandler("deletestoploss", self.cmd_delete_stop_loss),
+                CallbackQueryHandler(self.cmd_delete_stop_loss, pattern="^help_deletestoploss$"),
+            ],
             states={
                 SELECTING_DELETE_ORDER: [CallbackQueryHandler(self.select_delete_order)]
             },
@@ -155,7 +161,10 @@ class TelegramBot:
         
         # 更新止损订单会话处理器
         update_stop_loss_conv = ConversationHandler(
-            entry_points=[CommandHandler("updatestoploss", self.cmd_update_stop_loss)],
+            entry_points=[
+                CommandHandler("updatestoploss", self.cmd_update_stop_loss),
+                CallbackQueryHandler(self.cmd_update_stop_loss, pattern="^help_updatestoploss$"),
+            ],
             states={
                 SELECTING_UPDATE_ORDER: [CallbackQueryHandler(self.select_update_order)],
                 SELECTING_UPDATE_FIELD: [CallbackQueryHandler(self.select_update_field)],
@@ -385,12 +394,12 @@ class TelegramBot:
 
     # ==================== 命令处理器 ====================
     
-    async def _reply(self, update: Update, text: str):
+    async def _reply(self, update: Update, text: str, reply_markup=None):
         """统一回复方法：支持命令消息和按钮回调两种来源"""
         if update.message:
-            await update.message.reply_text(text)
+            await update.message.reply_text(text, reply_markup=reply_markup)
         elif update.callback_query:
-            await update.callback_query.message.reply_text(text)
+            await update.callback_query.message.reply_text(text, reply_markup=reply_markup)
         else:
             await self.send_message(text)
 
@@ -540,40 +549,41 @@ class TelegramBot:
         await self._reply(update, text)
 
     async def cmd_add_stop_loss(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """处理 /addstoploss 命令 - 开始添加止损订单流程"""
+        """处理 /addstoploss 命令或菜单按钮 - 开始添加止损订单流程"""
+        # 兼容按钮回调来源
+        if update.callback_query:
+            await update.callback_query.answer()
         if not self._is_authorized(update):
             await self._unauthorized_handler(update)
             return ConversationHandler.END
         try:
-            logger.info(f"用户 {update.message.from_user.id} 执行 /addstoploss 命令")
+            user = update.effective_user
+            logger.info(f"用户 {user.id} 执行添加止损操作")
             # 获取当前持仓
             positions = await self.stop_loss_manager.binance_client.get_positions()
             logger.info(f"获取到 {len(positions)} 个持仓")
-            
+
             if not positions:
-                await update.message.reply_text("📭 当前没有持仓，无法添加止损订单")
+                await self._reply(update, "📭 当前没有持仓，无法添加止损订单")
                 return ConversationHandler.END
-            
+
             # 创建按钮
             keyboard = []
             for pos in positions:
                 button_text = f"{pos['symbol']} ({pos['side']})"
                 keyboard.append([InlineKeyboardButton(button_text, callback_data=f"symbol|{pos['symbol']}|{pos['side']}")])
-            
+
             keyboard.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
             reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.message.reply_text(
-                "请选择要设置止损的持仓：",
-                reply_markup=reply_markup
-            )
-            
-            logger.info(f"已发送持仓选择消息给用户 {update.message.from_user.id}")
+
+            await self._reply(update, "请选择要设置止损的持仓：", reply_markup=reply_markup)
+
+            logger.info(f"已发送持仓选择消息给用户 {user.id}")
             return SELECTING_SYMBOL
             
         except Exception as e:
-            logger.error(f"执行 /addstoploss 命令时出错: {e}", exc_info=True)
-            await update.message.reply_text(f"❌ 获取持仓失败: {e}")
+            logger.error(f"执行添加止损操作时出错: {e}", exc_info=True)
+            await self._reply(update, f"❌ 获取持仓失败: {e}")
             return ConversationHandler.END
 
     async def select_symbol(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -761,30 +771,29 @@ class TelegramBot:
             return ConversationHandler.END
 
     async def cmd_delete_stop_loss(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """处理 /deletestoploss 命令 - 删除止损订单"""
+        """处理 /deletestoploss 命令或菜单按钮 - 删除止损订单"""
+        if update.callback_query:
+            await update.callback_query.answer()
         if not self._is_authorized(update):
             await self._unauthorized_handler(update)
             return ConversationHandler.END
         stop_losses = self.database.get_all_stop_losses()
-        
+
         if not stop_losses:
-            await update.message.reply_text("📭 当前没有止损订单")
+            await self._reply(update, "📭 当前没有止损订单")
             return ConversationHandler.END
-        
+
         # 创建按钮
         keyboard = []
         for order in stop_losses:
             button_text = f"ID:{order.id} {order.symbol} {order.side} @ {order.stop_price}"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"delete_{order.id}")])
-        
+
         keyboard.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "请选择要删除的止损订单：",
-            reply_markup=reply_markup
-        )
-        
+
+        await self._reply(update, "请选择要删除的止损订单：", reply_markup=reply_markup)
+
         return SELECTING_DELETE_ORDER
 
     async def select_delete_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -810,30 +819,29 @@ class TelegramBot:
         return ConversationHandler.END
 
     async def cmd_update_stop_loss(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """处理 /updatestoploss 命令 - 更新止损价格"""
+        """处理 /updatestoploss 命令或菜单按钮 - 更新止损价格"""
+        if update.callback_query:
+            await update.callback_query.answer()
         if not self._is_authorized(update):
             await self._unauthorized_handler(update)
             return ConversationHandler.END
         stop_losses = self.database.get_all_stop_losses()
-        
+
         if not stop_losses:
-            await update.message.reply_text("📭 当前没有止损订单")
+            await self._reply(update, "📭 当前没有止损订单")
             return ConversationHandler.END
-        
+
         # 创建按钮
         keyboard = []
         for order in stop_losses:
             button_text = f"ID:{order.id} {order.symbol} {order.side} @ {order.stop_price} [{order.timeframe}]"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"update_{order.id}")])
-        
+
         keyboard.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "请选择要更新的止损订单：",
-            reply_markup=reply_markup
-        )
-        
+
+        await self._reply(update, "请选择要更新的止损订单：", reply_markup=reply_markup)
+
         return SELECTING_UPDATE_ORDER
 
     async def select_update_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1127,19 +1135,6 @@ class TelegramBot:
         if command in handler_map:
             await handler_map[command](update, context)
             return
-
-        # 操作类命令：提示用户使用对应命令（因为需要 ConversationHandler 状态机）
-        action_map = {
-            "addstoploss": ("➕ 添加止损", "/addstoploss"),
-            "updatestoploss": ("✏️ 更新止损", "/updatestoploss"),
-            "deletestoploss": ("🗑 删除止损", "/deletestoploss"),
-        }
-
-        if command in action_map:
-            label, cmd = action_map[command]
-            await self.send_message(
-                f"{label}\n\n请发送 {cmd} 命令来开始操作。"
-            )
 
     # ==================== 通知方法 ====================
     
