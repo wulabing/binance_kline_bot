@@ -19,3 +19,4 @@ test*.py
 .codex/
 .gemini/
 .qwen/
+.workflow/
