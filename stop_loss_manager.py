@@ -92,8 +92,6 @@ class StopLossManager:
         initialized = 0
         for symbol, timeframe in kline_keys:
             key = f"{symbol}_{timeframe}"
-            if key in self.last_kline_close_time:
-                continue
             try:
                 klines = await self.binance_client.get_kline_data(symbol, timeframe, limit=2)
                 current_time = await self.binance_client.get_server_time()
@@ -570,14 +568,13 @@ class StopLossManager:
         # 添加到数据库
         order_id = self.database.add_stop_loss(symbol, side, stop_price, timeframe, quantity)
 
-        # 初始化 last_kline_close_time，避免立刻评估历史已收盘K线
+        # 仅在该交易对周期尚无基准时初始化，避免覆盖已有订单正在使用的基准
         kline_key = f"{symbol}_{timeframe}"
         if kline_key not in self.last_kline_close_time:
             try:
                 klines = await self.binance_client.get_kline_data(symbol, timeframe, limit=2)
                 current_time = await self.binance_client.get_server_time()
                 if klines:
-                    # 找到最近一根已收盘的K线，记录其close_time
                     for kline in klines:
                         if current_time >= kline['close_time']:
                             self.last_kline_close_time[kline_key] = kline['close_time']
@@ -592,4 +589,3 @@ class StopLossManager:
         logger.info(f"添加止损订单成功: ID {order_id}, {symbol} {side} @ {stop_price} [{timeframe}]")
 
         return order_id
-
