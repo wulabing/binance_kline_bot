@@ -2,117 +2,75 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## 项目概述
+## Project Overview
 
-币安合约止损管理机器人 - 基于 K 线收盘价确认的止损系统，通过 Telegram Bot 进行交互。
-纯 Python asyncio 异步架构，无测试框架、无 linter 配置。
+Binance Futures 止损交易机器人，通过 Telegram Bot 提供用户交互界面，基于K线收盘价执行止损逻辑。支持币安双向持仓（Hedge Mode）。
 
-## 常用命令
+Python 3.10 + asyncio，无框架，纯脚本架构。
+
+## Commands
 
 ```bash
-# 启动/停止/重启（后台运行，使用虚拟环境 .binance-telegram-venv）
-bash start.sh          # nohup 后台启动，输出到 nohup.out
-bash stop.sh
-bash restart.sh
+# 启动（后台 nohup，写 .pid 文件）
+./start.sh
 
-# 前台调试运行
-source .binance-telegram-venv/bin/activate && python main.py
+# 停止（读 .pid，发 SIGTERM，等待优雅退出）
+./stop.sh
 
-# 查看日志
-tail -f trading_bot.log    # 主日志（logging 模块输出）
-tail -f nohup.out          # 后台运行 stdout/stderr
+# 重启
+./restart.sh
+
+# 虚拟环境
+source .binance-telegram-venv/bin/activate
+pip install -r requirements.txt
+
+# 直接前台运行（调试用）
+python main.py
 ```
 
-## 架构概览
+没有测试框架、没有 linter、没有 CI。日志输出到 `trading_bot.log` 和 stdout。
+
+## Architecture
 
 ```
-main.py (TradingBot) ─── 组件编排 + 回调注册
-    ├── binance_client.py (BinanceClient)      # 币安 REST API + WebSocket
-    ├── telegram_bot.py (TelegramBot)          # Telegram 交互 (python-telegram-bot)
-    ├── stop_loss_manager.py (StopLossManager)  # K线止损监控引擎
-    └── database.py (Database + StopLossOrder)  # SQLite 持久化
+main.py              — 入口，TradingBot 编排类，组装组件并设置回调
+binance_client.py    — 币安 REST API + WebSocket User Data Stream
+stop_loss_manager.py — K线收盘止损引擎，监控+执行
+telegram_bot.py      — Telegram Bot 交互层（命令、会话、通知）
+database.py          — SQLite 存储层（止损订单 CRUD）
 ```
 
-### 回调驱动的组件通信
+### Data Flow
 
-`TradingBot.setup_callbacks()` 是理解组件协作的关键入口。各组件通过回调函数松耦合连接：
+1. `BinanceClient` 通过 WebSocket 接收持仓/订单变更事件
+2. `TradingBot` 通过回调函数桥接事件到 `TelegramBot` 发送通知
+3. `StopLossManager` 轮询K线数据，收盘价触发止损时调用 `BinanceClient.place_market_order`
+4. 用户通过 Telegram 命令（ConversationHandler 多步会话）管理止损订单
+5. `Database` (SQLite WAL) 持久化止损订单
 
-```
-BinanceClient ──on_position_update──→ TradingBot ──→ TelegramBot.notify_position_update()
-              ──on_position_closed──→ TradingBot ──→ TelegramBot.notify_position_closed()
-              ──on_order_update────→ TradingBot ──→ TelegramBot.notify_order_update()
+### Key Patterns
 
-StopLossManager ──on_stop_loss_triggered──→ TradingBot ──→ TelegramBot.notify_stop_loss_triggered()
-                ──on_evaluation_notification──→ TradingBot ──→ TelegramBot.notify_evaluation()
-```
+- **回调驱动**: `BinanceClient` 和 `StopLossManager` 通过 `on_xxx` 回调属性通知上层，`TradingBot.setup_callbacks()` 统一注册
+- **双向持仓**: 所有持仓用 `{symbol}_{side}` (如 `BTCUSDT_LONG`) 作为唯一 key
+- **K线收盘止损**: 不用实时价格，等K线完全收盘后评估，`last_kline_close_time` 防重复处理
+- **评估批量通知**: 同一周期的多个币种评估结果延迟 8 秒合并发送
+- **WebSocket 重连对账**: 重连后通过 REST API 全量比对持仓和订单缓存
+- **后台任务生命周期**: `_track_task()` + `_background_tasks` set，优雅停机时统一 cancel
 
-### 异步运行时
+### Telegram Bot Commands
 
-- 整个应用运行在单个 `asyncio` 事件循环中
-- `TradingBot.start()` 使用 `asyncio.run()` 启动
-- WebSocket 连接、K线监控、健康检查均为独立的 `asyncio.Task`
-- 并发保护：`BinanceClient` 使用 `asyncio.Lock` 保护订单缓存
+`/start` `/help` `/positions` `/orders` `/stoplosses` `/addstoploss` `/updatestoploss` `/deletestoploss` `/cancel`
 
-### 双向持仓 Key 约定
+添加/更新/删除止损使用 `ConversationHandler` 多步会话流程（InlineKeyboard 选择 + 文本输入）。
 
-全局统一使用 `{symbol}_{side}` 作为持仓标识（如 `BTCUSDT_LONG`、`ETHUSDT_SHORT`）。
-此约定贯穿 `BinanceClient` 持仓缓存、`StopLossManager` 止损匹配、`Database` 查询。
+## Config
 
-### WebSocket 连接与重连
+`config.ini`（从 `config.ini.example` 复制），包含 `[binance]` `[telegram]` `[trading]` `[database]` 四个 section。
 
-- **用户数据流**: 持仓/订单/账户更新，通过 `listenKey` 鉴权，30分钟自动续期
-- **K线数据流**: `StopLossManager` 按需通过 REST API 获取（非持久 WebSocket）
-- **重连策略**: 指数退避 5s→60s，重连后调用 `_check_missed_orders()` 补漏
-- **心跳**: ping 间隔 20s，超时 10s
+## Key Conventions
 
-### Telegram Bot 会话状态机
-
-`TelegramBot` 使用 `ConversationHandler` 管理多步骤对话，状态常量定义在类顶部：
-
-```
-添加止损: SELECTING_SYMBOL(0) → SELECTING_TIMEFRAME(1) → ENTERING_PRICE(2)
-删除止损: SELECTING_DELETE_ORDER(3)
-更新止损: SELECTING_UPDATE_ORDER(4) → SELECTING_UPDATE_FIELD(5) → UPDATING_PRICE(6)/UPDATING_TIMEFRAME(7)
-```
-
-用户中间数据存储在 `context.user_data` 字典中（symbol, side, timeframe 等）。
-
-### 止损监控流程
-
-`StopLossManager._monitor_stop_losses()` 每 5 秒轮询一次：
-1. 从 Database 获取所有活跃止损订单
-2. 按 `(symbol, timeframe)` 分组，创建并发监控任务
-3. REST API 获取最近 2 根 K 线（倒数第二根为已收盘）
-4. 仅评估已收盘且未处理过的 K 线（通过 `last_checked_kline` 去重）
-5. 多头: 收盘价 ≤ 止损价 → 触发；空头: 收盘价 ≥ 止损价 → 触发
-6. 触发后执行市价单平仓，通过回调通知 Telegram
-
-### 数据模型
-
-`StopLossOrder` (database.py) — SQLite 表 `stop_loss_orders`:
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | INTEGER PK | 自增主键 |
-| symbol | TEXT | 交易对 (如 BTCUSDT) |
-| side | TEXT | 持仓方向 (LONG/SHORT) |
-| stop_price | REAL | 止损触发价 |
-| timeframe | TEXT | K线周期 (15m/1h/4h) |
-| quantity | REAL | 平仓数量 (NULL=全部平仓) |
-| created_at | TEXT | 创建时间 |
-| updated_at | TEXT | 更新时间 |
-
-## 配置文件
-
-`config.ini`（从 `config.ini.example` 复制）:
-- `[binance]`: api_key, api_secret, testnet (true/false)
-- `[telegram]`: bot_token, chat_id
-- `[trading]`: default_timeframe (15m/1h/4h), enable_evaluation_notification (true/false，控制K线评估通知)
-- `[database]`: db_path
-
-## 关键依赖
-
-- `aiohttp` — 币安 REST API 请求
-- `websockets` — 币安 WebSocket 连接
-- `python-telegram-bot` (v20.x) — Telegram Bot 异步 API
-- Python 3.8+，无额外构建工具
+- 所有异步，基于 `asyncio.run()`
+- 日志统一用 `logging.getLogger(__name__)`
+- 数据库每次操作独立 `connect/close`，WAL 模式
+- HTTP 请求带指数退避重试（`_request` 方法）
+- 进程管理通过 `.pid` 文件 + shell 脚本
