@@ -24,12 +24,23 @@ if [ -f ".pid" ]; then
     fi
 fi
 
-# 检查虚拟环境
-VENV_DIR=".binance-telegram-venv"
-if [ ! -d "$VENV_DIR" ]; then
-    echo "错误: 虚拟环境目录 $VENV_DIR 不存在"
-    echo "请先创建虚拟环境: python3 -m venv $VENV_DIR"
-    exit 1
+# 虚拟环境自动检测
+# 优先级: $VENV_DIR 环境变量 > .venv > venv > .binance-telegram-venv
+NEED_INSTALL=false
+if [ -z "$VENV_DIR" ]; then
+    for candidate in .venv venv .binance-telegram-venv; do
+        if [ -d "$candidate" ]; then
+            VENV_DIR="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -z "$VENV_DIR" ]; then
+    echo "未找到虚拟环境，正在创建 .venv ..."
+    python3 -m venv .venv || { echo "错误: 创建虚拟环境失败"; exit 1; }
+    VENV_DIR=".venv"
+    NEED_INSTALL=true
 fi
 
 # 激活虚拟环境
@@ -62,10 +73,9 @@ echo "✓ 配置文件存在"
 # 检查依赖
 echo ""
 echo "检查 Python 依赖..."
-if ! pip show python-telegram-bot > /dev/null 2>&1; then
-    echo "警告: 依赖包未安装或不完整"
+if [ "$NEED_INSTALL" = true ] || ! pip show python-telegram-bot > /dev/null 2>&1; then
     echo "正在安装依赖..."
-    pip install -r requirements.txt
+    pip install -r requirements.txt || { echo "错误: 依赖安装失败"; exit 1; }
 fi
 
 echo "✓ 依赖检查完成"
