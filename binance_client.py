@@ -239,6 +239,27 @@ class BinanceClient:
         
         return positions
 
+    async def get_futures_balance(self) -> List[Dict]:
+        """获取合约账户余额
+
+        Returns:
+            余额列表，每项包含 asset, balance, available, unrealized_pnl
+        """
+        data = await self._request('GET', '/fapi/v2/balance', signed=True)
+
+        balances = []
+        for item in data:
+            balance = float(item.get('balance', 0))
+            if balance != 0:
+                balances.append({
+                    'asset': item['asset'],
+                    'balance': balance,
+                    'available': float(item.get('availableBalance', 0)),
+                    'unrealized_pnl': float(item.get('crossUnPnl', 0)),
+                })
+
+        return balances
+
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict]:
         """获取当前委托订单"""
         params = {}

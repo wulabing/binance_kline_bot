@@ -123,6 +123,7 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("help", self.cmd_help))
         self.application.add_handler(CommandHandler("positions", self.cmd_positions))
         self.application.add_handler(CommandHandler("orders", self.cmd_orders))
+        self.application.add_handler(CommandHandler("balance", self.cmd_balance))
         self.application.add_handler(CommandHandler("stoplosses", self.cmd_stop_losses))
         
         # 添加止损订单会话处理器
@@ -205,6 +206,7 @@ class TelegramBot:
             BotCommand("help", "显示帮助信息"),
             BotCommand("positions", "查看当前持仓"),
             BotCommand("orders", "查看币安委托订单"),
+            BotCommand("balance", "查看合约账户余额"),
             BotCommand("stoplosses", "查看所有止损订单"),
             BotCommand("addstoploss", "添加止损订单"),
             BotCommand("updatestoploss", "更新止损订单"),
@@ -412,6 +414,7 @@ class TelegramBot:
             ],
             [
                 InlineKeyboardButton("🛡 止损订单", callback_data="help_stoplosses"),
+                InlineKeyboardButton("💰 合约余额", callback_data="help_balance"),
             ],
             [
                 InlineKeyboardButton("➕ 添加止损", callback_data="help_addstoploss"),
@@ -478,6 +481,34 @@ class TelegramBot:
 
         except Exception as e:
             await self._reply(update, f"❌ 获取持仓失败: {e}")
+
+    async def cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /balance 命令 - 查看合约账户余额"""
+        if not self._is_authorized(update):
+            await self._unauthorized_handler(update)
+            return
+        try:
+            text = await self._build_balance_text()
+            await self._reply(update, text)
+        except Exception as e:
+            await self._reply(update, f"❌ 获取余额失败: {e}")
+
+    async def _build_balance_text(self) -> str:
+        """构建合约账户余额文本"""
+        balances = await self.stop_loss_manager.binance_client.get_futures_balance()
+
+        if not balances:
+            return "📭 合约账户暂无余额"
+
+        text = "💰 合约账户余额：\n\n"
+        for b in balances:
+            text += (
+                f"🔸 {b['asset']}\n"
+                f"  余额: {b['balance']:.4f}\n"
+                f"  可用: {b['available']:.4f}\n"
+                f"  未实现盈亏: {b['unrealized_pnl']:.4f}\n\n"
+            )
+        return text
 
     async def cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理 /orders 命令 - 查看币安委托订单"""
@@ -1130,6 +1161,7 @@ class TelegramBot:
             "positions": self.cmd_positions,
             "orders": self.cmd_orders,
             "stoplosses": self.cmd_stop_losses,
+            "balance": self.cmd_balance,
         }
 
         if command in handler_map:
@@ -1174,7 +1206,7 @@ class TelegramBot:
         # 根据方向选择emoji
         side_icon = "🟢" if data['previous_side'] == 'LONG' else "🔴"
         side_text = "做多" if data['previous_side'] == 'LONG' else "做空"
-        
+
         text = (
             self._build_notification_header("🔒 持仓平仓通知")
             + f"🏷 交易对：{data['symbol']}\n"
@@ -1184,6 +1216,14 @@ class TelegramBot:
             + self.NOTIFICATION_BOTTOM_SEPARATOR
         )
         await self.send_message(text)
+
+        # 平仓后等待结算完成再查询余额
+        await asyncio.sleep(2)
+        try:
+            balance_text = await self._build_balance_text()
+            await self.send_message(balance_text)
+        except Exception as e:
+            logger.error(f"平仓后获取余额失败: {e}")
 
     async def notify_order_update(self, order: Dict):
         """通知订单更新"""
